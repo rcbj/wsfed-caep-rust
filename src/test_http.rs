@@ -4,6 +4,7 @@
 use super::test_support::{self as stub, AssertionOptions, MetaOptions, WResultOptions};
 use crate::demo::{endpoints_for, App};
 use crate::relying_party::{first_map, RelyingParty};
+use crate::ssf::{events, SignalEvent};
 use crate::test_support::{PASSIVE, REALM, REPLY};
 use serde_json::json;
 use std::collections::HashMap;
@@ -59,6 +60,16 @@ fn sign_in_cleanup_and_logout() {
     assert_eq!(status, 303, "{}", String::from_utf8_lossy(&msg));
     let sid = cookie(&fields, "sid");
     assert!(!sid.is_empty());
+    let (status, fields, body) = app.handle("GET", "/live-status", &header(&[("cookie", &format!("sid={sid}"))]), b"");
+    assert_eq!(status, 200);
+    assert!(fields.iter().any(|(name, value)| name == "cache-control" && value == "no-store"));
+    let live: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(live["signedIn"], json!(true));
+    assert_eq!(live["subject"], json!("alice-1234"));
+    assert_eq!(live["receiver"], json!("not configured"));
+    assert_eq!(live["events"], json!([]));
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains("Assertion") && !text.contains("wresult"), "{text}");
     let (status, _, page) = app.handle("GET", "/", &header(&[("cookie", &format!("sid={sid}"))]), b"");
     assert_eq!(status, 200);
     let page = String::from_utf8_lossy(&page);
@@ -95,4 +106,47 @@ fn loopback_follows_port_and_public_url_keeps_the_path() {
     let (realm, reply) = endpoints_for("http://[::1]:3000/", "http://[::1]:3000/wsfed", "", false, 19141);
     assert_eq!(realm, "http://[::1]:19141/");
     assert_eq!(reply, "http://[::1]:19141/wsfed");
+}
+
+fn signal(kind: &str, jti: &str, sessions: Vec<String>) -> SignalEvent {
+    SignalEvent { event_type: kind.to_string(), payload: json!({}), subject: HashMap::new(), jti: jti.to_string(), sessions, ended: false, iat: None, txn: None }
+}
+
+#[test]
+fn live_status_records_events_and_session_revoked_ends_the_one_session() {
+    let config = serde_json::json!({
+        "realm": REALM,
+        "replyUrl": REPLY,
+        "privateKey": stub::rp_key(),
+        "certificate": stub::rp_cert(),
+        "idpMetadata": stub::idp_metadata(&MetaOptions::default()),
+    });
+    let rp = RelyingParty::create(config.as_object().unwrap(), Path::new(".")).unwrap();
+    let app = App::new(rp, None);
+    let (_, fields, _) = app.handle("GET", "/login", &HashMap::new(), b"");
+    let location = fields.iter().find(|(name, _)| name.eq_ignore_ascii_case("location")).map(|(_, value)| value.clone()).unwrap();
+    let params = first_map(url::Url::parse(&location).unwrap().query().unwrap_or(""));
+    let pending = cookie(&fields, "wsfed_pending");
+    let made = stub::signed_assertion(&AssertionOptions::default()).unwrap();
+    let result = stub::wresult(&WResultOptions { token: Some(made.xml), ..WResultOptions::default() }).unwrap();
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("wa", "wsignin1.0")
+        .append_pair("wresult", &result)
+        .append_pair("wctx", params.get("wctx").map(String::as_str).unwrap_or(""))
+        .finish();
+    let (_, fields, _) = app.handle("POST", "/wsfed", &header(&[("cookie", &format!("wsfed_pending={pending}"))]), form.as_bytes());
+    let sid = cookie(&fields, "sid");
+    let status = |app: &App| -> serde_json::Value {
+        let (_, _, body) = app.handle("GET", "/live-status", &header(&[("cookie", &format!("sid={sid}"))]), b"");
+        serde_json::from_slice(&body).unwrap()
+    };
+    app.remember(&signal(events::event("credential_change"), "jti-1", Vec::new()));
+    let live = status(&app);
+    assert_eq!(live["signedIn"], json!(true));
+    assert_eq!(live["events"], json!([{"type": events::event("credential_change"), "jti": "jti-1"}]));
+    app.remember(&signal(events::event("session_revoked"), "jti-2", Vec::new()));
+    let live = status(&app);
+    assert_eq!(live["signedIn"], json!(false));
+    assert_eq!(live["subject"], json!(null));
+    assert_eq!(live["events"][1], json!({"type": events::event("session_revoked"), "jti": "jti-2"}));
 }
