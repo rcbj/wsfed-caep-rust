@@ -4,7 +4,7 @@
 use crate::config::parse_object;
 use crate::error::Result;
 use crate::relying_party::{LoginOptions, ReplyBody, ReplyRequest, RelyingParty};
-use crate::ssf::{ReceiverOptions, SignalsReceiver, TlsConfig};
+use crate::ssf::{events, ReceiverOptions, SignalEvent, SignalsReceiver, TlsConfig};
 use crate::token::Login;
 use crate::x509util::cert_pem_body;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -23,9 +23,13 @@ const GIF_B64: &str = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// The WS-Federation demo. `GET /live-status` is JSON: signedIn, subject, receiver, and the
+/// accepted Shared Signals events (type and jti). It never includes tokens or assertions.
 pub struct App {
     pub rp: RelyingParty,
     pub receiver: Mutex<Option<Arc<SignalsReceiver>>>,
+    pub receiver_state: Mutex<String>,
+    events: Mutex<Vec<(String, String)>>,
     sessions: Arc<Mutex<HashMap<String, Login>>>,
     secret: Vec<u8>,
     reply_path: String,
@@ -38,12 +42,40 @@ impl App {
         let reply = url::Url::parse(&rp.config.reply_url).ok();
         let path = reply.as_ref().map(|item| item.path().to_string()).filter(|item| !item.is_empty()).unwrap_or_else(|| "/wsfed".to_string());
         let secure = if reply.as_ref().is_some_and(|item| item.scheme() == "https") { "; Secure".to_string() } else { String::new() };
-        Self { rp, receiver: Mutex::new(receiver), sessions: Arc::new(Mutex::new(HashMap::new())), secret: secret.to_vec(), reply_path: path, secure }
+        Self { rp, receiver: Mutex::new(receiver), receiver_state: Mutex::new("not configured".to_string()), events: Mutex::new(Vec::new()), sessions: Arc::new(Mutex::new(HashMap::new())), secret: secret.to_vec(), reply_path: path, secure }
     }
 
     pub fn sessions_handle(&self) -> Arc<Mutex<HashMap<String, Login>>> { self.sessions.clone() }
 
     pub fn drop_session(&self, id: &str) { self.sessions.lock().unwrap().remove(id); }
+
+    /// Record an accepted Shared Signals event for `GET /live-status`.
+    pub fn remember(&self, event: &SignalEvent) {
+        self.events.lock().unwrap().push((event.event_type.clone(), event.jti.clone()));
+        // iya-sts main sets the WS-Federation assertion's SessionIndex to the
+        // assertion id. The CAEP session-revoked subject names the sign-on
+        // session instead, so the index finds nobody and the end callback is
+        // not asked to drop this login. This demo has that one session.
+        if event.event_type != events::event("session_revoked") || !event.sessions.is_empty() { return; }
+        let ids: Vec<String> = self.sessions.lock().unwrap().drain().map(|(id, _)| id).collect();
+        if let Some(receiver) = self.receiver.lock().unwrap().as_ref() {
+            for id in &ids { receiver.untrack(id); }
+        }
+    }
+
+    fn live_status(&self, sid: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let who = if sid.is_empty() { None } else { self.sessions.lock().unwrap().get(sid).cloned() };
+        let events: Vec<serde_json::Value> = self.events.lock().unwrap().iter()
+            .map(|(kind, jti)| serde_json::json!({"type": kind, "jti": jti}))
+            .collect();
+        let body = serde_json::json!({
+            "signedIn": who.is_some(),
+            "subject": who.as_ref().map(|item| item.name_id.clone()),
+            "receiver": self.receiver_state.lock().unwrap().clone(),
+            "events": events,
+        });
+        (200, vec![("content-type".to_string(), "application/json".to_string()), ("cache-control".to_string(), "no-store".to_string())], body.to_string().into_bytes())
+    }
 
     fn sign(&self, value: &str) -> String {
         let mut mac = HmacSha256::new_from_slice(&self.secret).expect("hmac");
@@ -70,6 +102,9 @@ impl App {
         let method = method.to_ascii_uppercase();
         if path == "/healthz" && method == "GET" {
             return (200, vec![("content-type".to_string(), "text/plain".to_string())], b"ok".to_vec());
+        }
+        if path == "/live-status" && method == "GET" {
+            return self.live_status(&sid);
         }
         if path == "/login" && method == "GET" {
             let request = match self.rp.login(&LoginOptions { relay_state: Some("/".to_string()), ..LoginOptions::default() }) {
@@ -311,8 +346,20 @@ pub fn main_args() -> i32 {
         let app = Arc::new(App::new(party, None));
         *sessions_slot.lock().unwrap() = Some(app.sessions_handle());
         let signals_off = raw.get("signals").and_then(|item| item.as_bool()) == Some(false);
+        let ssf_block = raw.get("ssf").and_then(|item| item.as_object());
+        let transmitter_of = ssf_block.and_then(|ssf| ssf.get("transmitter")).and_then(|item| item.as_str()).unwrap_or("");
+        let state = if signals_off {
+            Some("not configured (signals are off)")
+        } else if transmitter_of.is_empty() {
+            Some("not configured (no ssf block in the configuration file)")
+        } else if app.rp.config.private_key.is_none() {
+            Some("not running: the relying party has no private key")
+        } else {
+            None
+        };
+        if let Some(state) = state { *app.receiver_state.lock().unwrap() = state.to_string(); }
         if !signals_off {
-            if let Some(ssf) = raw.get("ssf").and_then(|item| item.as_object()) {
+            if let Some(ssf) = ssf_block {
                 let transmitter = ssf.get("transmitter").and_then(|item| item.as_str()).unwrap_or("");
                 if !transmitter.is_empty() && app.rp.config.private_key.is_some() {
                     let interval = ssf.get("pollIntervalMs").and_then(|item| item.as_i64().or_else(|| item.as_f64().map(|n| n as i64))).filter(|n| *n > 0).unwrap_or(5000);
@@ -324,11 +371,29 @@ pub fn main_args() -> i32 {
                         poll_interval_ms: interval,
                         ..ReceiverOptions::default()
                     }) {
-                        Ok(receiver) => match receiver.start() {
-                            Ok(()) => *app.receiver.lock().unwrap() = Some(receiver),
-                            Err(err) => println!("ssf: not started: {err}"),
-                        },
-                        Err(err) => println!("ssf: not started: {err}"),
+                        Ok(receiver) => {
+                            let weak = Arc::downgrade(&app);
+                            receiver.on("*", Arc::new(move |event| {
+                                if let Some(app) = weak.upgrade() { app.remember(event); }
+                                Ok(())
+                            }));
+                            *app.receiver.lock().unwrap() = Some(receiver.clone());
+                            match receiver.start() {
+                                Ok(()) => {
+                                    let stream_id = receiver.stream().get("stream_id").and_then(|item| item.as_str()).unwrap_or("").to_string();
+                                    *app.receiver_state.lock().unwrap() = format!("polling stream {stream_id} at {transmitter}");
+                                }
+                                Err(err) => {
+                                    *app.receiver.lock().unwrap() = None;
+                                    *app.receiver_state.lock().unwrap() = format!("not running: {err}");
+                                    println!("ssf: not started: {err}");
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            *app.receiver_state.lock().unwrap() = format!("not running: {err}");
+                            println!("ssf: not started: {err}");
+                        }
                     }
                 }
             }
