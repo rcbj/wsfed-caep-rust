@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "wsfed-caep"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Server-side WS-Federation relying party"
+publish = false
+
+[dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
+base64 = "0.22"
+block-padding = "0.3"
+cbc = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+cipher = "0.4"
+hmac = "0.12"
+pem = "3"
+rand = "0.8"
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+signature = "2"
+tiny_http = "0.12"
+ua-cryptography-xml-c14n = "0.1.6"
+ureq = "2.12"
+url = "2"
+webpki-roots = "0.26"
+x509-parser = "0.16"
+
+[[bin]]
+name = "wsfed-demo"
+path = "src/bin/wsfed-demo.rs"
+
+[[bin]]
+name = "wsfed-caep"
+path = "src/bin/wsfed-caep.rs"

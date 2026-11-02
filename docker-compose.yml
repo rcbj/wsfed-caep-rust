@@ -1,0 +1,10 @@
+services:
+  wsfed-demo:
+    build: .
+    image: wsfed-caep-rust-demo
+    network_mode: host
+    environment:
+      PORT: ${PORT:-3000}
+    volumes:
+      - ./demo/generated:/app/demo/generated:ro
+    stop_grace_period: 5s
