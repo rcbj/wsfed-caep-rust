@@ -21,6 +21,16 @@ client is `python3 scripts/configure_iya_sts.py` on the host, standard library
 only. Cargo never runs on the host. Do not bind port 3000, 8081, or 18481 to
 18495.
 
+The order is the one a user follows. The checkout is copied to a scratch build
+context (never demo/generated, .git or target), and the demo image is built from
+it so `wsfed-caep generate-keys` can write the key pair there. The registrar then
+runs against that copy and writes iya-sts's listener CA trust chain where idpCa
+names it (demo/generated/idp-ca.pem). THEN the demo image is built again, which
+bakes that chain in (only the demo/ layer changes), and THEN the demo runs from
+it. Nothing here fetches the CA for the demo, rewrites idpCa, or mounts a CA into
+the demo container: only the key pair and the IdP metadata are mounted, file by
+file. This script reads the saved chain for its own HTTPS client.
+
 IYA_STS_URL, when set, uses an iya-sts that is already running and does not
 stop it. This script never removes iya-sts-live-main, iya-sts-live-probe, or a
 container whose name starts with sts. Otherwise it clones main (or builds
@@ -229,19 +239,43 @@ def wait_port(port, timeout):
     raise RuntimeError(f"127.0.0.1:{port} did not accept a connection")
 
 
-def fetch_ca(origin, dest):
+def wait_ready(origin, timeout):
+    """Wait for iya-sts's /healthcheck. Unverified: nothing is trusted from it."""
     parts = urllib.parse.urlsplit(origin)
     context = ssl._create_unverified_context()
-    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=30)
-    try:
-        conn.request("GET", "/tls/server-certificate")
-        response = conn.getresponse()
-        body = response.read()
-    finally:
-        conn.close()
-    if response.status != 200 or b"BEGIN CERTIFICATE" not in body:
-        raise RuntimeError(f"GET /tls/server-certificate answered {response.status}")
-    dest.write_bytes(body)
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=10)
+            try:
+                conn.request("GET", "/healthcheck")
+                response = conn.getresponse()
+                response.read()
+            finally:
+                conn.close()
+            if response.status == 200:
+                return
+            last = f"answered {response.status}"
+        except OSError as err:
+            last = str(err)
+        time.sleep(2)
+    raise RuntimeError(f"{origin}/healthcheck was not ready: {last}")
+
+
+def copy_context(dest):
+    """Copy the checkout to a build context, without .git, target or demo/generated."""
+
+    def ignore(directory, names):
+        here = Path(directory).resolve()
+        skipped = {".git", "__pycache__"} & set(names)
+        if here == ROOT:
+            skipped |= {"target"} & set(names)
+        if here == ROOT / "demo":
+            skipped |= {"generated"} & set(names)
+        return skipped
+
+    shutil.copytree(ROOT, dest, ignore=ignore)
 
 
 def rewrite_config(source, dest, sts_origin, demo_origin):
@@ -624,32 +658,37 @@ def main():
     work = Path(tempfile.mkdtemp(prefix=PROFILE["repo"] + "-live-"))
     try:
         wait_port(urllib.parse.urlsplit(sts_origin).port or 443, 120)
-        ca_file = work / "idp-ca.pem"
-        deadline = time.time() + 90
-        last_error = None
-        while time.time() < deadline:
-            try:
-                fetch_ca(sts_origin, ca_file)
-                last_error = None
-                break
-            except Exception as err:
-                last_error = err
-                time.sleep(2)
-        if last_error:
-            raise last_error
-        config = work / "wsfed.json"
+        wait_ready(sts_origin, 90)
+        context = work / "context"
+        copy_context(context)
+        demo_dir = context / "demo"
+        config = demo_dir / "wsfed.json"
         rewrite_config(ROOT / PROFILE["config_file"], config, sts_origin, demo_origin)
-        docker("build", "-t", image, str(ROOT))
-        generate_keys(image, work, config)
+        # Built once without a chain (as a fresh clone would be) for the key pair;
+        # the registrar writes the chain where idpCa names it; built again, which
+        # changes only the demo/ layer.
+        docker("build", "-t", image, str(context))
+        generate_keys(image, demo_dir, config)
         configure_demo(config, sts_origin, demo_origin, username, password, secret)
+        ca_file = demo_dir / "generated" / "idp-ca.pem"
+        if not ca_file.exists():
+            raise RuntimeError(f"the registrar did not write {ca_file}")
+        docker("build", "-t", image, str(context))
+        baked = docker("run", "--rm", image, "cat", "demo/generated/idp-ca.pem", capture_output=True)
+        if baked.stdout != ca_file.read_text(encoding="utf-8"):
+            raise RuntimeError("the demo image does not carry the chain the registrar wrote")
+        chain_count = baked.stdout.count("BEGIN CERTIFICATE")
+        print(f"the demo image carries the {chain_count}-certificate chain at /app/demo/generated/idp-ca.pem", flush=True)
         docker_rm(demo_name)
+        mounts = []
+        for name in ("rp.key", "rp.crt", "idp-metadata.xml"):
+            mounts += ["-v", f"{demo_dir / 'generated' / name}:/app/demo/generated/{name}:ro"]
         docker(
             "run", "-d", "--name", demo_name, "--network", "host",
             "--user", f"{os.getuid()}:{os.getgid()}",
-            "-v", f"{work}:/work",
+            *mounts,
             "-e", f"PORT={demo_port}",
             "-e", f"PUBLIC_URL={demo_origin}",
-            "-e", "WSFED_CONFIG=/work/wsfed.json",
             image,
         )
         deadline = time.time() + 90
@@ -701,7 +740,7 @@ def main():
             ),
             "session-revoked to end the local session",
         )
-        print(json.dumps({"ok": True, "subject": signed_in.get("subject"), "events": finished.get("events")}, indent=2))
+        print(json.dumps({"ok": True, "subject": signed_in.get("subject"), "idpCaInImage": chain_count, "events": finished.get("events")}, indent=2))
     finally:
         docker_rm(demo_name)
         if sts_name:
