@@ -19,9 +19,11 @@ Omitted or `true` means on. The resolved configuration leaves `signals_set` fals
 
 ## Tests
 
-```sh
-cargo test
+```bash
+docker build --target test .
 ```
+
+The `test` stage runs `cargo test` in `rust:1-bookworm`. GitHub Actions uses that command. Do not run Cargo on the host. The demo image does not run the suite.
 
 Rust covers the stub IdP (a signed SAML assertion the library accepts), replay, metadata, the self-signed certificate, the SSF poll receiver, the setup script's signals behavior, and the demo handler. No live iya-sts.
 
