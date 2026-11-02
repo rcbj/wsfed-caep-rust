@@ -5,7 +5,7 @@ SPDX-License-Identifier: MIT
 
 # wsfed-caep
 
-Rust port of the server-side WS-Federation relying party. Crate `wsfed-caep`, edition 2021. Version 0.1.0. License MIT (`LICENSE`). Publishing is not set up. When this tree is published, `develop` and `main` are the same commit.
+Rust port of the server-side WS-Federation relying party. Crate `wsfed-caep`, edition 2021. Version 0.1.0. License MIT (`LICENSE`). A pull request merged into `main` publishes the crate to crates.io after the test workflow succeeds on that commit. A direct push does not. The token is the `CARGO_REGISTRY_TOKEN` repository secret. A version already on crates.io stays there; the next release is a new `version` in `Cargo.toml`. When this tree is published, `develop` and `main` are the same commit.
 
 ## Usage
 
