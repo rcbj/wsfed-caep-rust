@@ -48,7 +48,10 @@ def usage() -> str:
                   their paths (default: unset; $PUBLIC_URL). Without it, a loopback realm and
                   reply URL follow the running demo's PORT, then $PORT. Any other host is left
                   as written.
-  --test-user     The test user to create (default: wsfed-demo-user).
+  --test-user     The test user to create (default: wsfed-demo-user). Its password is
+                  $WSFED_DEMO_USER_PASSWORD, or one is generated and written to
+                  generated/<user>.password beside the configuration (mode 0600); only the
+                  path is printed.
   --no-test-user  Do not create a test user.
   --dry-run       Print what would be done, and send nothing.
 
@@ -282,6 +285,7 @@ def _request(url: str, method: str = "GET", headers: dict | None = None, body: b
     context = None
     if url.startswith("https"):
         context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         if ca:
             context.load_verify_locations(cadata=ca)
     req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
@@ -416,7 +420,7 @@ def main(argv: list[str] | None = None) -> None:
     Path(files["idp_metadata"]).write_text(fetched["body"], encoding="utf-8")
     print(f"Saved the IdP metadata to {files['idp_metadata']}")
     if args["test_user"]:
-        _ensure_user(base, ca, token, args["test_user"], api)
+        _ensure_user(base, ca, token, args["test_user"], api, Path(args["config"]).resolve().parent / "generated")
     print("Done. Start the demo with: docker compose up --build")
 
 
@@ -431,7 +435,7 @@ def _mint(origin: str, base: str, ca: str | None, secret: str) -> str:
     return reply["body"]["access_token"]
 
 
-def _ensure_user(base: str, ca: str | None, token: str, username: str, api) -> None:
+def _ensure_user(base: str, ca: str | None, token: str, username: str, api, generated: Path) -> None:
     found = _json(f"{base}/admin-api/users?user={urllib.parse.quote(username)}", ca, headers={"accept": "application/json", "authorization": f"Bearer {token}"})
     password = os.environ.get("WSFED_DEMO_USER_PASSWORD") or ""
     if found["body"].get("known") is True and password:
@@ -449,7 +453,16 @@ def _ensure_user(base: str, ca: str | None, token: str, username: str, api) -> N
             raise RuntimeError(f"creating {username} was refused: {json.dumps(made['body'])[:300]}")
         print(f"Created user {username}.")
         if made["body"].get("password"):
-            print(f"Generated password for {username} (shown once): {made['body']['password']}")
+            # Never printed: a password does not belong in a log. It goes to a file only its
+            # owner can read, created 0600, in demo/generated, which never enters an image
+            # (.dockerignore admits only idpCa's chain).
+            saved = generated / f"{username}.password"
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(saved, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as out:
+                os.fchmod(out.fileno(), 0o600)
+                out.write(f"{made['body']['password']}\n")
+            print(f"Generated a password for {username}; it is in {saved} (readable by you only).")
 
 
 if __name__ == "__main__":
