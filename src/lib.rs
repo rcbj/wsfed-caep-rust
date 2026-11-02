@@ -51,3 +51,5 @@ mod test_http;
 mod test_configure;
 #[cfg(test)]
 mod test_trust_chain;
+#[cfg(test)]
+mod test_plain_http;
