@@ -7,7 +7,7 @@ SPDX-License-Identifier: MIT
 
 Server-side WS-Federation relying party for Rust. It accepts SAML 2.0 bearer assertions, reads identity-provider federation metadata, writes relying-party metadata, verifies XML signatures, decrypts encrypted assertions, and remembers assertion ids so a bearer token cannot be replayed. A Shared Signals poll receiver for CAEP and RISC is included. The relying party does not start that receiver.
 
-Version 0.1.0. License: MIT. Crate `wsfed-caep`, edition 2021. Publishing is not set up. `develop` and `main` are the same commit when this tree is published; nothing here creates a remote.
+Version 0.1.0. License: MIT. Crate `wsfed-caep`, edition 2021. A pull request merged into `main` publishes the crate to crates.io after the test workflow succeeds on that commit. A direct push does not. The token is the `CARGO_REGISTRY_TOKEN` repository secret. A version already on crates.io stays there; the next release is a new `version` in `Cargo.toml`. `develop` and `main` are the same commit when this tree is published; nothing here creates a remote.
 
 ## Usage
 

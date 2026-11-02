@@ -6,8 +6,14 @@ name = "wsfed-caep"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+authors = ["rcbjBlueMars <9321971+rcbjBlueMars@users.noreply.github.com>"]
 description = "Server-side WS-Federation relying party"
-publish = false
+repository = "https://github.com/rcbj/wsfed-caep-rust"
+homepage = "https://github.com/rcbj/wsfed-caep-rust"
+documentation = "https://docs.rs/wsfed-caep"
+readme = "README.md"
+keywords = ["ws-federation", "saml", "caep", "sso"]
+categories = ["authentication"]
 
 [dependencies]
 aes = "0.8"
