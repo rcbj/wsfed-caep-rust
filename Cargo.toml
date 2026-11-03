@@ -20,7 +20,7 @@ aes = "0.8"
 aes-gcm = "0.10"
 base64 = "0.22"
 block-padding = "0.3"
-cbc = "0.1"
+cbc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 cipher = "0.4"
 hmac = "0.12"
