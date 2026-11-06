@@ -149,21 +149,21 @@ pub fn decrypt_element(encrypted: Node, key: &RsaPrivateKey) -> Result<String> {
 }
 
 fn decrypt_gcm(size: usize, key: &[u8], nonce: &[u8], data: &[u8]) -> std::result::Result<Vec<u8>, aes_gcm::Error> {
-    let nonce = aes_gcm::Nonce::from_slice(nonce);
+    let nonce = aes_gcm::Nonce::<U12>::try_from(nonce).map_err(|_| aes_gcm::Error)?;
     match size {
-        16 => Aes128Gcm::new_from_slice(key).map_err(|_| aes_gcm::Error)?.decrypt(nonce, data),
-        24 => Aes192Gcm::new_from_slice(key).map_err(|_| aes_gcm::Error)?.decrypt(nonce, data),
-        _ => Aes256Gcm::new_from_slice(key).map_err(|_| aes_gcm::Error)?.decrypt(nonce, data),
+        16 => Aes128Gcm::new_from_slice(key).map_err(|_| aes_gcm::Error)?.decrypt(&nonce, data),
+        24 => Aes192Gcm::new_from_slice(key).map_err(|_| aes_gcm::Error)?.decrypt(&nonce, data),
+        _ => Aes256Gcm::new_from_slice(key).map_err(|_| aes_gcm::Error)?.decrypt(&nonce, data),
     }
 }
 
 fn decrypt_cbc(size: usize, key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    use aes::cipher::{BlockDecryptMut, KeyIvInit};
+    use aes::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
     let mut buf = data.to_vec();
     let out = match size {
-        16 => cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv).map_err(|err| dec(err.to_string()))?.decrypt_padded_mut::<block_padding::Pkcs7>(&mut buf).map_err(|_| dec("the content could not be decrypted"))?.to_vec(),
-        24 => cbc::Decryptor::<aes::Aes192>::new_from_slices(key, iv).map_err(|err| dec(err.to_string()))?.decrypt_padded_mut::<block_padding::Pkcs7>(&mut buf).map_err(|_| dec("the content could not be decrypted"))?.to_vec(),
-        _ => cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv).map_err(|err| dec(err.to_string()))?.decrypt_padded_mut::<block_padding::Pkcs7>(&mut buf).map_err(|_| dec("the content could not be decrypted"))?.to_vec(),
+        16 => cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv).map_err(|err| dec(err.to_string()))?.decrypt_padded::<Pkcs7>(&mut buf).map_err(|_| dec("the content could not be decrypted"))?.to_vec(),
+        24 => cbc::Decryptor::<aes::Aes192>::new_from_slices(key, iv).map_err(|err| dec(err.to_string()))?.decrypt_padded::<Pkcs7>(&mut buf).map_err(|_| dec("the content could not be decrypted"))?.to_vec(),
+        _ => cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv).map_err(|err| dec(err.to_string()))?.decrypt_padded::<Pkcs7>(&mut buf).map_err(|_| dec("the content could not be decrypted"))?.to_vec(),
     };
     Ok(out)
 }
