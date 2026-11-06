@@ -9,10 +9,9 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use block_padding::Pkcs7;
 use cbc::Encryptor;
 use chrono::{Duration, Utc};
-use cipher::{BlockEncryptMut, KeyIvInit};
+use cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
 use rand::rngs::OsRng;
 use rsa::traits::PublicKeyParts;
 use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
@@ -165,7 +164,7 @@ pub fn encrypt(plain: &str, cipher_name: &str, transport: &str, wrapper: &str) -
             let key: [u8; 32] = rand::random();
             let iv: [u8; 12] = rand::random();
             let cipher = Aes256Gcm::new_from_slice(&key).map_err(|err| crate::fail("decryption", err.to_string()))?;
-            let sealed = cipher.encrypt(Nonce::from_slice(&iv), plain.as_bytes()).map_err(|err| crate::fail("decryption", err.to_string()))?;
+            let sealed = cipher.encrypt(&Nonce::from(iv), plain.as_bytes()).map_err(|err| crate::fail("decryption", err.to_string()))?;
             let mut value = iv.to_vec();
             value.extend(sealed);
             (key.to_vec(), value, "http://www.w3.org/2009/xmlenc11#aes256-gcm")
@@ -176,7 +175,7 @@ pub fn encrypt(plain: &str, cipher_name: &str, transport: &str, wrapper: &str) -
             let enc = Encryptor::<Aes128>::new_from_slices(&key, &iv).map_err(|err| crate::fail("decryption", err.to_string()))?;
             let mut buf = vec![0u8; plain.len() + 16];
             buf[..plain.len()].copy_from_slice(plain.as_bytes());
-            let out = enc.encrypt_padded_mut::<Pkcs7>(&mut buf, plain.len()).map_err(|err| crate::fail("decryption", err.to_string()))?.to_vec();
+            let out = enc.encrypt_padded::<Pkcs7>(&mut buf, plain.len()).map_err(|err| crate::fail("decryption", err.to_string()))?.to_vec();
             let mut value = iv.to_vec();
             value.extend(out);
             (key.to_vec(), value, "http://www.w3.org/2001/04/xmlenc#aes128-cbc")
