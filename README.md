@@ -72,6 +72,15 @@ docker build --target test .
 
 The suite runs in a container: `cargo test --all-features`, then the default build's refusal of a `pep` section.
 
+**AuthZEN table.** `src/test_authzen.json` is this library's own set of AuthZEN cases for the embedded PEP: catalogue rows (typed values, bags, dotted paths, short names), policies in ALFA, and sign-ins (`Login`) with an `Access` and the answer the host must see. `cargo test` runs every case in `local` mode against a stub PDP. The live half proves `central` and `local` always answer alike, against a fresh iya-sts with embedded-PEP support:
+
+```sh
+IYA_STS_IMAGE=<an iya-sts image with #2026-#2028> python3 scripts/live_authzen.py
+python3 scripts/live_authzen.py --compile   # after changing the table's ALFA
+```
+
+It provisions the application, two PEPs (`central` and `local`), the catalogue and the policies, runs every case through both (`authzen_live`, in Docker), and fails when they differ or either differs from the table. Its last output is JSON with the cases run, how many were equal and as expected, and each mismatch. Ports as below (18517; never 3000, 8081, 18481 to 18495).
+
 `cargo test` covers the stub IdP (a signed SAML assertion the library accepts), replay, metadata, the self-signed certificate, the SSF poll receiver, the setup script's signals behavior, and the demo handler. No live iya-sts. XML signatures use exclusive canonicalization from `ua-cryptography-xml-c14n` and an RSA-SHA256 check in this crate. rsa-sha256 is `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`. Status success is `urn:oasis:names:tc:SAML:2.0:status:Success`. Bearer confirmation is `urn:oasis:names:tc:SAML:2.0:cm:bearer`. This tree does not wrap another WS-Federation relying party and does not need libxml2.
 
 ## Live sign-in

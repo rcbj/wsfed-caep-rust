@@ -57,3 +57,5 @@ mod test_trust_chain;
 mod test_plain_http;
 #[cfg(test)]
 mod test_pep;
+#[cfg(all(test, feature = "local"))]
+mod test_authzen;
