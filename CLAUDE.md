@@ -25,7 +25,7 @@ Omitted or `true` means on. The resolved configuration leaves `signals_set` fals
 docker build --target test .
 ```
 
-The `test` stage runs `cargo test` in `rust:1-bookworm`. GitHub Actions uses that command. Do not run Cargo on the host. The demo image does not run the suite.
+The `test` stage runs `cargo test --all-features`, then `cargo test --lib pep_section_is_refused` (the default build refusing a `pep` section), in `rust:1-bookworm`. GitHub Actions uses that command. Do not run Cargo on the host. The demo image does not run the suite.
 
 Rust covers the stub IdP (a signed SAML assertion the library accepts), replay, metadata, the self-signed certificate, the SSF poll receiver, the setup script's signals behavior, and the demo handler. No live iya-sts.
 
@@ -36,6 +36,25 @@ Rust covers the stub IdP (a signed SAML assertion the library accepts), replay, 
 `GET /live-status` is JSON: `signedIn`, `subject`, `receiver`, and `events` (`type` as the full CAEP URI, and `jti`). No tokens or assertions. iya-sts main sets the assertion SessionIndex to the assertion id, so a session-revoked event finds nobody in the index. `App::remember` in `src/demo.rs` then ends the demo's one session and untracks it. That is demo code; the library is unchanged.
 
 `.github/workflows/nightly.yml` runs `docker build --target test .` and then `python3 scripts/live_iya_sts.py` at 07:06 UTC (`6 7 * * *`), and on `workflow_dispatch`. `tests.yml` has no schedule.
+
+## Embedded PEP (#40)
+
+iya-sts#1206 work item 8, behind the `pep` feature (`local` adds the engine). `src/pep.rs` wires in the shared `iya-pep` crate (rcbj/iya-pep-rust), the same way oidc-caep-risc-rust#47 does.
+- `resolve_config` keeps the `pep` section in `Resolved::pep`, with `assertionKey` resolved against the configuration's directory. Without the feature, a `pep` section is refused rather than ignored.
+- `RelyingParty::create`/`from_file` build and start the PEP once the metadata is read:
+  - `pdpUrl` defaults to the IdP's entityID, which is iya-sts's realm issuer with the `/realm/<id>` prefix;
+  - `application` defaults to `realm`;
+  - `signals` is the library's, and `tlsCa` is `idpCa`;
+  - an assertion key that is `privateKey` is refused, compared by JWK thumbprint.
+- `SignalsReceiver::new` refuses a TLS client key equal to the PEP's. With `ReceiverOptions::pep` set, it adds `pep-policies-changed` to `events_requested` and registers the hand-over when the PEP wants events (`local`, or `central` with a Permit cache).
+- `decide` and `decide_session` turn a `Login` into the PEP's subject through `pep::subject_of`:
+  - The id is the `name` claim, else the NameID. iya-sts puts the username in both; `nameidentifier` is the opaque sub.
+  - The properties are the attributes keyed by FriendlyName, else the Name's last segment, because catalogue properties are `[A-Za-z0-9_$@:-]` segments. Then `acr`, `amr` and `auth_time`.
+  - `decide_session` denies a session the receiver no longer tracks (`SignalsReceiver::is_tracked`) or one past `SessionNotOnOrAfter`.
+- The demo protects `/orders/<id>`. The image builds with `local`.
+- `src/test_pep.rs` has its own stub PDP (tiny_http) and reuses `test_ssf.rs`'s transmitter stub.
+- **The dependency is a git dependency on iya-pep-rust's `feature/1`** until that crate's first release. Switch it to the crates.io version then, because crates.io refuses a git dependency at publish.
+- The live test of the PEP waits for iya-sts #2026–#2028.
 
 ## Layout
 

@@ -51,6 +51,12 @@ impl MemorySessionIndex {
         inner.sessions.insert(session.local_id.clone(), session);
     }
 
+    /// Whether `local_id` is tracked and not past its expiry.
+    pub fn contains(&self, local_id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.sessions.get(local_id).is_some_and(|session| session.expires_at.is_none_or(|expires| expires > Utc::now()))
+    }
+
     pub fn remove(&self, local_id: &str) {
         self.inner.lock().unwrap().sessions.remove(local_id);
     }

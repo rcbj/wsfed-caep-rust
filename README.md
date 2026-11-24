@@ -41,13 +41,46 @@ The generated certificate's common name defaults to `wsfed-caep-nodejs relying p
 
 **Plain http.** Federation metadata from a URL and every Shared Signals transmitter call (configuration, JWKS, stream, poll) use https. A plain `http://` URL is refused before any connection unless its host is loopback (`127.0.0.0/8`, `::1`, `localhost`), because metadata carries the signing keys and Shared Signals carry SETs and the bearer token. Redirects are not followed. A URL with userinfo is never loopback, and a URL holding whitespace or a control character is refused. The `WsFedError` keeps the fetch's code (`metadata`, `ssf`) and its message names the scheme and host only. There is no opt-out. The relying party's own realm and reply URL may stay http: they are never fetched.
 
+## Embedded PEP (features `pep` and `local`)
+
+The [iya-pep](https://github.com/rcbj/iya-pep-rust) crate, wired in (iya-sts [#1206](https://github.com/rcbj/iya-sts/issues/1206)): an application asks iya-sts's policy whether a signed-in person may act on a resource.
+
+```toml
+wsfed-caep = { version = "…", features = ["pep"] }    # central: AuthZEN at iya-sts
+wsfed-caep = { version = "…", features = ["local"] }  # local too: decided in process
+```
+
+Add a `pep` section to the configuration. It is off unless present, and a build without the `pep` feature refuses it rather than ignoring it:
+
+```json
+"pep": { "name": "pep-orders", "mode": "local", "assertionKey": "file:generated/pep-key.pem" }
+```
+
+- **Defaults from this library:**
+  - `pdpUrl` is the identity provider's entityID. iya-sts publishes its realm's issuer there, which is the service's base with the `/realm/<id>` prefix. Set `pdpUrl` for an identity provider whose entityID is not an http(s) URL.
+  - `application` is `realm` (the wtrealm), the identifier iya-sts registers a WS-Federation relying party under.
+  - `signals` follows the library's `signals`, and `tlsCa` is `idpCa`.
+  - `assertionKey` is a path; a relative one is taken from the configuration file's directory, like `privateKey`.
+  - iya-pep's README lists every member.
+- **The PEP's key is its own.** `create` refuses an assertion key that is `privateKey` (the relying party's signing and decryption key), and `SignalsReceiver::new` refuses one that is its TLS client key. Keys are compared by JWK thumbprint. Certify the key and bind the PEP to the application with iya-sts's `issue-pep-credential`.
+- **Deciding:**
+  - `party.decide(&login, &Access::new("read", "order", "42"))`, where `login` is what `handle_reply` returned.
+  - `party.decide_session(&receiver, session_id, &login, &access)` for a sign-in tracked with `receiver.track(session_id, …)`. A session that ended is a Deny without asking: untracked, past its expiry, ended by a Shared Signals event such as CAEP `session-revoked`, or past the assertion's `SessionNotOnOrAfter`.
+  - **The subject** is the validated token, never a request header:
+    - Its id is the `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name` claim, else the NameID. iya-sts puts the directory's username in both, which is what its PIP resolves. The `nameidentifier` claim is the opaque `sub` and is never the id.
+    - Its properties are the attributes, each keyed by its FriendlyName, else the last segment of its Name (`emailaddress`, `role`), because a catalogue property can't name a URI. On top of those, from the signed AuthnStatement: `acr` (AuthnContextClassRef), `amr` (the `authenticationmethod` claim) and `auth_time` (AuthnInstant, epoch seconds).
+    - Only the properties the realm's AuthZEN catalogue declares are sent.
+  - The answer is `Permit { obligations, advice }`, `Deny` or `Unavailable`. `Unavailable` means there is no `pep` section, no policy is held yet, or the service can't be reached. It is never a Permit.
+- **Signals.** A `SignalsReceiver` given the PEP (`ReceiverOptions { pep: party.pep().cloned(), .. }`) asks its stream for `urn:iya:sts:secevent:event-type:pep-policies-changed`. It does that always in `local` mode, and in `central` when `permitCacheMs` is set. It verifies the SET like any other and hands the event to the PEP, which then pulls with its own token. With `signals: false`, a `local` PEP polls at `pollIntervalMs`.
+- **The demo** protects `GET /orders/<id>` with the PEP when the image is built with `local` (the Dockerfile does) and `demo/wsfed.json` has a `pep` section.
+
 ## Tests
 
 ```bash
 docker build --target test .
 ```
 
-The suite runs in a container.
+The suite runs in a container: `cargo test --all-features`, then the default build's refusal of a `pep` section.
 
 `cargo test` covers the stub IdP (a signed SAML assertion the library accepts), replay, metadata, the self-signed certificate, the SSF poll receiver, the setup script's signals behavior, and the demo handler. No live iya-sts. XML signatures use exclusive canonicalization from `ua-cryptography-xml-c14n` and an RSA-SHA256 check in this crate. rsa-sha256 is `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`. Status success is `urn:oasis:names:tc:SAML:2.0:status:Success`. Bearer confirmation is `urn:oasis:names:tc:SAML:2.0:cm:bearer`. This tree does not wrap another WS-Federation relying party and does not need libxml2.
 

@@ -24,6 +24,10 @@ pub struct Resolved {
     pub certificate: Option<IdpCert>,
     pub idp_ca: String,
     pub idp_entity_id: String,
+    /// The `pep` section (the embedded iya-sts PEP, the `pep` feature), with a
+    /// relative `assertionKey` made absolute against the configuration's
+    /// directory. `None` when the configuration has none.
+    pub pep: Option<Value>,
 }
 
 fn is_pem(value: &str) -> bool { value.contains("-----BEGIN ") }
@@ -99,7 +103,7 @@ pub fn resolve_config(config: &Map<String, Value>, base_dir: &Path) -> Result<Re
     let mut out = Resolved {
         realm, reply_url: reply, idp_metadata: meta, clock_skew_ms: skew_ms,
         want_assertions_encrypted: want, allow_unsolicited: allow, request_token_type: request_type,
-        signals_set: false, signals: true, private_key: None, certificate: None, idp_ca: String::new(), idp_entity_id: String::new(),
+        signals_set: false, signals: true, private_key: None, certificate: None, idp_ca: String::new(), idp_entity_id: String::new(), pep: None,
     };
     if !signals {
         out.signals_set = true;
@@ -131,7 +135,39 @@ pub fn resolve_config(config: &Map<String, Value>, base_dir: &Path) -> Result<Re
     if let Some(id) = config.get("idpEntityId").and_then(|item| item.as_str()) {
         if !id.is_empty() { out.idp_entity_id = id.to_string(); }
     }
+    if let Some(section) = config.get("pep").filter(|item| !item.is_null()) {
+        // Refused rather than ignored: a build without the PEP would otherwise
+        // run with every decision the section asked for silently missing.
+        #[cfg(not(feature = "pep"))]
+        {
+            let _ = section;
+            return Err(fail("config", "pep is configured, and this build has no embedded PEP (the wsfed-caep `pep` feature)"));
+        }
+        #[cfg(feature = "pep")]
+        {
+            out.pep = Some(pep_section(section, base_dir));
+        }
+    }
     Ok(out)
+}
+
+/// The `pep` section as iya-pep reads it, with `assertionKey` (a path the PEP
+/// reads again when the key rotates) resolved like this file's other key
+/// references: a `file:` prefix dropped and a relative path taken from the
+/// configuration's directory. Everything else is checked by iya-pep.
+#[cfg(feature = "pep")]
+fn pep_section(section: &Value, base_dir: &Path) -> Value {
+    let mut section = section.clone();
+    if let Some(key) = section.get("assertionKey").and_then(|item| item.as_str()) {
+        let key = key.strip_prefix("file:").unwrap_or(key);
+        if !key.is_empty() && !Path::new(key).is_absolute() {
+            let full = base_dir.join(key).to_string_lossy().into_owned();
+            section["assertionKey"] = Value::String(full);
+        } else {
+            section["assertionKey"] = Value::String(key.to_string());
+        }
+    }
+    section
 }
 
 pub fn read_config_file(path: &str, overrides: Option<&Map<String, Value>>) -> Result<Resolved> {

@@ -62,6 +62,11 @@ pub struct ReceiverOptions {
     pub poll_interval_ms: i64,
     pub max_events: i64,
     pub log: Option<Arc<dyn SignalsLog>>,
+    /// The relying party's embedded PEP (`RelyingParty::pep`). In `local`
+    /// mode, or `central` with a Permit cache, the receiver asks its stream
+    /// for `pep-policies-changed` and hands each verified one to it.
+    #[cfg(feature = "pep")]
+    pub pep: Option<Arc<crate::pep::Pep>>,
 }
 
 impl Default for ReceiverOptions {
@@ -76,6 +81,8 @@ impl Default for ReceiverOptions {
             poll_interval_ms: 0,
             max_events: 0,
             log: None,
+            #[cfg(feature = "pep")]
+            pep: None,
         }
     }
 }
@@ -126,11 +133,37 @@ impl SignalsReceiver {
             cert: if item.cert.is_empty() { None } else { Some(item.cert) },
             key: if item.key.is_empty() { None } else { Some(item.key) },
         });
+        #[allow(unused_mut)]
+        let mut events_requested = opts.events_requested.unwrap_or_else(events::default_events_requested);
+        #[allow(unused_mut)]
+        let mut handlers: HashMap<String, Vec<HandlerFn>> = HashMap::new();
+        #[cfg(feature = "pep")]
+        if let Some(pep) = opts.pep {
+            // D1: the PEP's key is its own, and the TLS client key is the
+            // receiver's.
+            let client_key = tls.as_ref().and_then(|item| item.key.as_deref()).and_then(crate::pep::pem_thumbprint);
+            if client_key.is_some_and(|thumbprint| thumbprint == pep.key_thumbprint()) {
+                return Err(fail("config", "the receiver's TLS client key is pep.assertionKey; the PEP needs a key of its own"));
+            }
+            // The PEP's policy events ride this stream (iya-sts#1206 D4).
+            if crate::pep::wants_events(&pep) {
+                if !events_requested.iter().any(|item| item == crate::pep::POLICIES_CHANGED_EVENT) {
+                    events_requested.push(crate::pep::POLICIES_CHANGED_EVENT.to_string());
+                }
+                // A handler sees an event only after its SET was verified;
+                // the PEP treats it as a hint and pulls with its own token.
+                let handler: HandlerFn = Arc::new(move |event: &SignalEvent| {
+                    pep.on_policy_event(&event.payload);
+                    Ok(())
+                });
+                handlers.insert(crate::pep::POLICIES_CHANGED_EVENT.to_string(), vec![handler]);
+            }
+        }
         Ok(Arc::new(Self {
             transmitter: transmitter.trim_end_matches('/').to_string(),
             on_end,
             tls,
-            events_requested: opts.events_requested.unwrap_or_else(events::default_events_requested),
+            events_requested,
             end_on: opts.end_on.unwrap_or_else(events::default_ending_events),
             index: opts.index.unwrap_or_else(|| MemorySessionIndex::new(0)),
             subject_attribute: opts.subject_attribute,
@@ -138,13 +171,24 @@ impl SignalsReceiver {
             poll_interval_ms: if opts.poll_interval_ms == 0 { 5000 } else { opts.poll_interval_ms },
             max_events: if opts.max_events == 0 { 50 } else { opts.max_events },
             log: opts.log.unwrap_or_else(|| Arc::new(StdLog)),
-            state: Mutex::new(State { config: Map::new(), stream: Map::new(), keys: Vec::new(), keys_at: None, ack: Vec::new(), errs: Map::new(), handlers: HashMap::new() }),
+            state: Mutex::new(State { config: Map::new(), stream: Map::new(), keys: Vec::new(), keys_at: None, ack: Vec::new(), errs: Map::new(), handlers }),
             running: AtomicBool::new(false),
             inflight: Mutex::new(None),
             stop_tx: Mutex::new(None),
             thread: Mutex::new(None),
             done_rx: Mutex::new(None),
         }))
+    }
+
+    /// The event types this receiver asks its stream for.
+    pub fn events_requested(&self) -> &[String] {
+        &self.events_requested
+    }
+
+    /// Whether the session `local_id` is tracked: tracked, not untracked,
+    /// not past its expiry, and not ended by an event.
+    pub fn is_tracked(&self, local_id: &str) -> bool {
+        self.index.contains(local_id)
     }
 
     pub fn stream(&self) -> Map<String, Value> {

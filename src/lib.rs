@@ -9,6 +9,8 @@ pub mod error;
 pub mod httpclient;
 pub mod metadata;
 pub mod names;
+#[cfg(feature = "pep")]
+pub mod pep;
 pub mod relying_party;
 pub mod replay;
 pub mod signature;
@@ -53,3 +55,5 @@ mod test_configure;
 mod test_trust_chain;
 #[cfg(test)]
 mod test_plain_http;
+#[cfg(test)]
+mod test_pep;

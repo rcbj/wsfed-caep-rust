@@ -56,17 +56,25 @@ struct State {
     jwk: Map<String, Value>,
 }
 
-struct Stub {
-    url: String,
+pub(crate) struct Stub {
+    pub(crate) url: String,
     state: Arc<Mutex<State>>,
     key: RsaPrivateKey,
-    other: RsaPrivateKey,
+    pub(crate) other: RsaPrivateKey,
     stop: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
 
 impl Stub {
-    fn new() -> Self {
+    #[cfg(feature = "pep")]
+    /// The ids the stub's poll was answered with an acknowledgement for.
+    pub(crate) fn acked(&self) -> Vec<String> { self.state.lock().unwrap().acked.clone() }
+
+    #[cfg(feature = "pep")]
+    /// The ids the receiver refused (`setErrs`).
+    pub(crate) fn refused(&self) -> Vec<String> { self.state.lock().unwrap().errs.keys().cloned().collect() }
+
+    pub(crate) fn new() -> Self {
         let key = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
         let other = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -88,7 +96,7 @@ impl Stub {
         Self { url, state, key, other, stop, join: Some(join) }
     }
 
-    fn put(&self, event_type: &str, sub: Value, extra: Option<Value>, key: Option<&RsaPrivateKey>, aud: &str, iss: &str) -> String {
+    pub(crate) fn put(&self, event_type: &str, sub: Value, extra: Option<Value>, key: Option<&RsaPrivateKey>, aud: &str, iss: &str) -> String {
         let mut bytes = [0u8; 16];
         for byte in &mut bytes { *byte = rand::random(); }
         let jti = b64(&bytes);
@@ -234,10 +242,10 @@ impl SignalsLog for MemLog {
     fn error(&self, message: &str) { self.errors.lock().unwrap().push(message.to_string()); }
 }
 
-struct Stop(Arc<SignalsReceiver>);
+pub(crate) struct Stop(pub(crate) Arc<SignalsReceiver>);
 impl Drop for Stop { fn drop(&mut self) { self.0.stop(); } }
 
-fn login_of(person: &str, session: &str) -> Login {
+pub(crate) fn login_of(person: &str, session: &str) -> Login {
     let mut attributes = HashMap::new();
     attributes.insert(DEFAULT_SUBJECT_ATTRIBUTE.to_string(), vec![format!("urn:uuid:{person}")]);
     attributes.insert("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress".to_string(), vec![format!("{person}@example.com")]);

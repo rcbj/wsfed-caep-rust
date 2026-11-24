@@ -165,11 +165,51 @@ impl App {
             let html = format!("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>WS-Federation</title><link rel=\"stylesheet\" href=\"/styles.css\"></head><body><main>{page}</main></body></html>");
             return (200, vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())], html.into_bytes());
         }
+        #[cfg(feature = "pep")]
+        if let Some(id) = path.strip_prefix("/orders/").filter(|id| !id.is_empty() && !id.contains('/')) {
+            return self.order(&sid, &method, id);
+        }
         if path == "/styles.css" && method == "GET" {
             let body = if STYLES.is_empty() { b"body{font-family:sans-serif}\n".to_vec() } else { STYLES.as_bytes().to_vec() };
             return (200, vec![("content-type".to_string(), "text/css".to_string())], body);
         }
         (404, vec![("content-type".to_string(), "text/plain".to_string())], b"Not found".to_vec())
+    }
+}
+
+impl App {
+    /// A route the embedded PEP protects (the `pep` feature, iya-sts#1206):
+    /// the signed-in person's access to one order, decided by the `pep`
+    /// section's PEP. A GET is `read` and anything else `write`. No sign-in
+    /// is 401, a Deny 403, and a decision that couldn't be made 503: never
+    /// served. With a running receiver the session must still be tracked,
+    /// so one ended by a Shared Signals event is a Deny.
+    #[cfg(feature = "pep")]
+    fn order(&self, sid: &str, method: &str, id: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        use crate::pep::{Access, Decision};
+        let html = |status: u16, title: &str, body: String| {
+            let page = format!("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title}</title><link rel=\"stylesheet\" href=\"/styles.css\"></head><body><main>{body}</main></body></html>");
+            (status, vec![("content-type".to_string(), "text/html; charset=utf-8".to_string()), ("cache-control".to_string(), "no-store".to_string())], page.into_bytes())
+        };
+        let who = if sid.is_empty() { None } else { self.sessions.lock().unwrap().get(sid).cloned() };
+        let Some(who) = who else {
+            return html(401, "Sign in", "<h1>Sign in first</h1><p><a href=\"/login\">Sign in</a></p>".to_string());
+        };
+        let action = if method == "GET" { "read" } else { "write" };
+        let access = Access::new(action, "order", id);
+        let receiver = self.receiver.lock().unwrap().clone();
+        let decision = match receiver {
+            Some(receiver) => self.rp.decide_session(&receiver, sid, &who, &access),
+            None => self.rp.decide(&who, &access),
+        };
+        match decision {
+            Decision::Permit { obligations, .. } => {
+                let note = if obligations.is_empty() { String::new() } else { format!("<p><small>{} obligation(s) to discharge.</small></p>", obligations.len()) };
+                html(200, "Order", format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", esc(id)))
+            }
+            Decision::Deny { why } => html(403, "Forbidden", format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", esc(id), esc(&why))),
+            Decision::Unavailable { why } => html(503, "Unavailable", format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(&why))),
+        }
     }
 }
 
@@ -369,6 +409,8 @@ pub fn main_args() -> i32 {
                     match SignalsReceiver::new(transmitter, Arc::new(move |ids, _| { for id in ids { sessions.lock().unwrap().remove(id); } Ok(()) }), ReceiverOptions {
                         tls: Some(TlsConfig { ca: app.rp.config.idp_ca.clone(), cert, key }),
                         poll_interval_ms: interval,
+                        #[cfg(feature = "pep")]
+                        pep: app.rp.pep().cloned(),
                         ..ReceiverOptions::default()
                     }) {
                         Ok(receiver) => {
