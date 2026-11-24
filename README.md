@@ -43,36 +43,26 @@ The generated certificate's common name defaults to `wsfed-caep-nodejs relying p
 
 ## Embedded PEP (features `pep` and `local`)
 
-The [iya-pep](https://github.com/rcbj/iya-pep-rust) crate, wired in (iya-sts [#1206](https://github.com/rcbj/iya-sts/issues/1206)): an application asks iya-sts's policy whether a signed-in person may act on a resource.
+Ask iya-sts's authorization policy whether a signed-in person may act on a resource, through the embedded Remote PEP (the shared [`iya-pep`](https://github.com/rcbj/iya-pep-rust) crate; iya-sts [#1206](https://github.com/rcbj/iya-sts/issues/1206)). **[docs/remote-pep.md](docs/remote-pep.md) is the full guide**: setting up iya-sts, choosing `central` or `local`, every configuration member, obligations, policy-change events, operating it and troubleshooting.
 
 ```toml
 wsfed-caep = { version = "…", features = ["pep"] }    # central: AuthZEN at iya-sts
 wsfed-caep = { version = "…", features = ["local"] }  # local too: decided in process
 ```
 
-Add a `pep` section to the configuration. It is off unless present, and a build without the `pep` feature refuses it rather than ignoring it:
-
 ```json
-"pep": { "name": "pep-orders", "mode": "local", "assertionKey": "file:generated/pep-key.pem" }
+"pep": { "name": "pep-orders", "mode": "local", "assertionKey": "pep-key.pem" }
 ```
 
-- **Defaults from this library:**
-  - `pdpUrl` is the identity provider's entityID. iya-sts publishes its realm's issuer there, which is the service's base with the `/realm/<id>` prefix. Set `pdpUrl` for an identity provider whose entityID is not an http(s) URL.
-  - `application` is `realm` (the wtrealm), the identifier iya-sts registers a WS-Federation relying party under.
-  - `signals` follows the library's `signals`, and `tlsCa` is `idpCa`.
-  - `assertionKey` is a path; a relative one is taken from the configuration file's directory, like `privateKey`.
-  - iya-pep's README lists every member.
-- **The PEP's key is its own.** `create` refuses an assertion key that is `privateKey` (the relying party's signing and decryption key), and `SignalsReceiver::new` refuses one that is its TLS client key. Keys are compared by JWK thumbprint. Certify the key and bind the PEP to the application with iya-sts's `issue-pep-credential`.
-- **Deciding:**
-  - `party.decide(&login, &Access::new("read", "order", "42"))`, where `login` is what `handle_reply` returned.
-  - `party.decide_session(&receiver, session_id, &login, &access)` for a sign-in tracked with `receiver.track(session_id, …)`. A session that ended is a Deny without asking: untracked, past its expiry, ended by a Shared Signals event such as CAEP `session-revoked`, or past the assertion's `SessionNotOnOrAfter`.
-  - **The subject** is the validated token, never a request header:
-    - Its id is the `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name` claim, else the NameID. iya-sts puts the directory's username in both, which is what its PIP resolves. The `nameidentifier` claim is the opaque `sub` and is never the id.
-    - Its properties are the attributes, each keyed by its FriendlyName, else the last segment of its Name (`emailaddress`, `role`), because a catalogue property can't name a URI. On top of those, from the signed AuthnStatement: `acr` (AuthnContextClassRef), `amr` (the `authenticationmethod` claim) and `auth_time` (AuthnInstant, epoch seconds).
-    - Only the properties the realm's AuthZEN catalogue declares are sent.
-  - The answer is `Permit { obligations, advice }`, `Deny` or `Unavailable`. `Unavailable` means there is no `pep` section, no policy is held yet, or the service can't be reached. It is never a Permit.
-- **Signals.** A `SignalsReceiver` given the PEP (`ReceiverOptions { pep: party.pep().cloned(), .. }`) asks its stream for `urn:iya:sts:secevent:event-type:pep-policies-changed`. It does that always in `local` mode, and in `central` when `permitCacheMs` is set. It verifies the SET like any other and hands the event to the PEP, which then pulls with its own token. With `signals: false`, a `local` PEP polls at `pollIntervalMs`.
-- **The demo** protects `GET /orders/<id>` with the PEP when the image is built with `local` (the Dockerfile does) and `demo/wsfed.json` has a `pep` section.
+```rust
+match party.decide_session(&receiver, &session_id, &login, &Access::new("read", "order", "42")) {
+    Decision::Permit { obligations, .. } => { /* discharge them, then serve */ }
+    Decision::Deny { .. } => { /* 403 */ }
+    Decision::Unavailable { .. } => { /* 503: fail closed, never a Permit */ }
+}
+```
+
+The section is off unless present, and a build without the feature refuses it. The PEP's key must be its own, and only the claims the realm's AuthZEN catalogue declares are sent. The demo protects `GET /orders/<id>` with the PEP.
 
 ## Tests
 
