@@ -68,12 +68,25 @@ impl App {
         let events: Vec<serde_json::Value> = self.events.lock().unwrap().iter()
             .map(|(kind, jti)| serde_json::json!({"type": kind, "jti": jti}))
             .collect();
-        let body = serde_json::json!({
+        #[allow(unused_mut)]
+        let mut body = serde_json::json!({
             "signedIn": who.is_some(),
             "subject": who.as_ref().map(|item| item.name_id.clone()),
             "receiver": self.receiver_state.lock().unwrap().clone(),
             "events": events,
         });
+        // The embedded PEP's status() holds no secret; its syncToken is the
+        // version of the policy held, not a credential.
+        #[cfg(feature = "pep")]
+        if let Some(pep) = self.rp.pep() {
+            let status = pep.status();
+            body["pep"] = serde_json::json!({
+                "name": status.name, "mode": status.mode.as_str(), "application": status.application,
+                "registered": status.registered, "holdsPolicy": status.holds_policy, "policyCount": status.policy_count,
+                "syncToken": status.sync_token, "decisions": status.decisions, "policyEvents": status.event_stream.as_str(),
+                "lastError": status.last_error,
+            });
+        }
         (200, vec![("content-type".to_string(), "application/json".to_string()), ("cache-control".to_string(), "no-store".to_string())], body.to_string().into_bytes())
     }
 

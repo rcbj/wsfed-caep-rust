@@ -13,6 +13,14 @@ A loopback realm and reply URL follow the port the demo listens on. The containe
 the shell PORT. An explicit --public-url or PUBLIC_URL replaces the origin and keeps the path.
 ``signals: false`` skips Shared Signals registration even when an ssf block is present.
 
+--pep central|local also sets the demo up with its embedded PEP, as docs/remote-pep.md's steps 2 to
+6 describe: the PEP's service account in remote-peps, a P-256 key made here with openssl
+(generated/pep-key.pem beside the configuration, 0600, never printed, kept out of the image by
+.dockerignore), issue-pep-credential binding it to the demo's application, the catalogue row the
+demo's policy reads (subject.acr), the application's OWN policy, which it then enforces (never the
+realm root), and a `pep` section in the configuration. Run it again to switch the mode: the
+account, the key and the policy are kept.
+
 Every run writes iya-sts's listener CA trust chain (leaf, TLS Issuing CA, Intermediate, Root) to the
 file idpCa names, through scripts/trust_chain.py. The demo image build copies that file in, so
 rebuild the image after running this against a different iya-sts.
@@ -33,13 +41,51 @@ LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 MULTIPLE_ACCOUNTS = {"key": "authn.multipleAccounts", "value": True}
 ROOT = Path(__file__).resolve().parent.parent
 
+# The embedded PEP (--pep). The key's path is relative to the configuration's directory, which is
+# also how the `pep` section names it: this library resolves assertionKey like privateKey.
+PEP_MODES = ("central", "local")
+PEP_NAME = "pep-wsfed-demo"
+PEP_KEY = "generated/pep-key.pem"
+PEP_KEY_IN_SECTION = "file:generated/pep-key.pem"
+PEP_GROUP = "remote-peps"
+PEP_EVENT = "urn:iya:sts:secevent:event-type:pep-policies-changed"
+ACR_ATTRIBUTE = "urn:example:acr"
+
+
+def orders_policy(namespace: str = "wsfeddemo", read_effect: str = "permit") -> str:
+    """ALFA for the demo's application (GET /orders/<id> is read, anything else write): read on an
+    order is `read_effect`, everything else is denied. A permit also needs the sign-in's acr (the
+    assertion's AuthnContextClassRef), which only the catalogue row brings, so a 200 shows the claim
+    arrived."""
+    condition = "            condition integerGreaterThan(stringBagSize(acr), 0)\n" if read_effect == "permit" else ""
+    return (
+        f"namespace {namespace} {{\n"
+        '    attribute act { category = actionCat id = "urn:oasis:names:tc:xacml:1.0:action:action-id" type = string }\n'
+        '    attribute rtype { category = resourceCat id = "urn:sts:xacml:authzen:resource-type" type = string }\n'
+        f'    attribute acr {{ category = subjectCat id = "{ACR_ATTRIBUTE}" type = string }}\n'
+        f"    policy {namespace}Orders {{\n"
+        f'        id = "urn:example:{namespace}-orders"\n'
+        "        apply firstApplicable\n"
+        "        rule readOrder {\n"
+        f"            {read_effect}\n"
+        '            target clause act == "read" and rtype == "order"\n'
+        f"{condition}"
+        "        }\n"
+        "        rule otherwise {\n"
+        "            deny\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trust_chain import save_trust_chain  # noqa: E402
 
 
 def usage() -> str:
     return """Usage: python scripts/configure_iya_sts.py [--config path] [--idp url] [--public-url url]
-                                        [--test-user name | --no-test-user] [--dry-run]
+                                        [--test-user name | --no-test-user]
+                                        [--pep central|local] [--pep-name name] [--dry-run]
 
   --config        The demo's WS-Federation configuration (default: demo/wsfed.json)
   --idp           iya-sts's base URL; the realm's, e.g. https://host/realm/acme, for a trust realm
@@ -53,6 +99,13 @@ def usage() -> str:
                   generated/<user>.password beside the configuration (mode 0600); only the
                   path is printed.
   --no-test-user  Do not create a test user.
+  --pep           Also set up the demo's embedded PEP in this mode (central or local): its service
+                  account, its key (generated/pep-key.pem beside the configuration, 0600, made
+                  with openssl), its binding to the demo's application, the catalogue row and
+                  the application's own policy (enforced), and a `pep` section written into the
+                  configuration. Run it again with the other mode to switch; the account, the
+                  key and the policy are kept.
+  --pep-name      The PEP's service account (default: pep-wsfed-demo).
   --dry-run       Print what would be done, and send nothing.
 
 The management API secret is ADMIN_API_CLIENT_SECRET or STS_ADMIN_API_CLIENT_SECRET."""
@@ -117,6 +170,8 @@ def parse_args(argv: list[str], env: dict | None = None) -> dict:
         "test_user": "wsfed-demo-user",
         "dry_run": False,
         "help": False,
+        "pep": "",
+        "pep_name": PEP_NAME,
     }
     i = 0
     while i < len(argv):
@@ -144,6 +199,14 @@ def parse_args(argv: list[str], env: dict | None = None) -> dict:
             out["test_user"] = ""
         elif arg == "--dry-run":
             out["dry_run"] = True
+        elif arg == "--pep":
+            out["pep"] = value().strip()
+            if out["pep"] not in PEP_MODES:
+                raise SystemExit(f"--pep must be central or local, not {out['pep']}")
+        elif arg == "--pep-name":
+            out["pep_name"] = value().strip()
+            if not out["pep_name"]:
+                raise SystemExit("--pep-name is empty")
         else:
             raise SystemExit(f"Unknown argument {arg}\n{usage()}")
         i += 1
@@ -313,6 +376,140 @@ def _errors_of(body: dict) -> list[str]:
     return [str(item) for item in (body.get("errors") or [])]
 
 
+def pep_plan(files: dict, base: str, name: str, mode: str) -> list[str]:
+    """What --pep does, for --dry-run. No key and no request leaves here."""
+    app = files["realm"]
+    return [
+        f"GET  {base}/admin-api/users?user={name}  # create the service account unless it exists",
+        f"POST {base}/admin-api/users/create  # {name}: a service account, owned by admin-write, no credential",
+        f"POST {base}/admin-api/groups/add-member  # {name} in {PEP_GROUP}",
+        f"# make a P-256 key in {PEP_KEY} beside the configuration (0600) unless one is there",
+        f"POST {base}/admin-api/xacml/issue-pep-credential  # its certificate request, bound to {app} (a new key or account)",
+        f"POST {base}/admin-api/xacml/set-pep-application  # or, with both kept, the binding to {app} again",
+        f"POST {base}/admin-api/xacml/authzen/set-attribute  # subject.acr -> {ACR_ATTRIBUTE}",
+        f"POST {base}/admin-api/applications/fga-create-policy  # {app}'s own policy, unless it has one",
+        f"POST {base}/admin-api/xacml/import-alfa  # the demo policy into it (only while {app} enforces none)",
+        f"POST {base}/admin-api/applications/fga-enable  # {app} enforces its own policy (the realm root is never touched)",
+        f"POST {base}/admin-api/applications/add  # {PEP_EVENT} in ssfAllowedEvents, only if {app} restricts them",
+        f"# write \"pep\": {{\"name\": \"{name}\", \"mode\": \"{mode}\", \"assertionKey\": \"{PEP_KEY_IN_SECTION}\"}} into the configuration",
+    ]
+
+
+def make_pep_key(key_file: Path) -> None:
+    """A P-256 key made here with openssl, created 0600. Neither it nor its contents are printed;
+    only its certificate request (pep_csr) is ever sent."""
+    import subprocess
+
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    old = os.umask(0o077)
+    try:
+        made = subprocess.run(["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", str(key_file)],
+                              check=False, capture_output=True, text=True)
+    finally:
+        os.umask(old)
+    if made.returncode != 0:
+        raise RuntimeError("openssl could not make the PEP's key (is openssl installed?)")
+    os.chmod(key_file, 0o600)
+
+
+def pep_csr(key_file: Path, name: str) -> str:
+    """The key's certificate request: the one thing about the key that leaves this machine."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as work:
+        csr = Path(work) / "pep.csr"
+        asked = subprocess.run(["openssl", "req", "-new", "-key", str(key_file), "-subj", f"/CN={name}", "-out", str(csr)],
+                               check=False, capture_output=True, text=True)
+        if asked.returncode != 0:
+            raise RuntimeError("openssl could not make the PEP's certificate request from its key")
+        return csr.read_text(encoding="utf-8")
+
+
+def _ok(answer: dict, what: str, allow: str = "") -> bool:
+    """An /admin-api act that worked (True), or one refused only because it is already so (False,
+    `allow` matched in the refusal's words). Anything else raises."""
+    body = answer["body"]
+    if answer["status"] == 200 and body.get("ok") is not False:
+        return True
+    words = (" ".join(_errors_of(body)) + " " + str(body.get("why") or "")).lower()
+    if allow and allow in words:
+        return False
+    raise RuntimeError(f"{what}: refused ({answer['status']}): {json.dumps(body)[:400]}")
+
+
+def write_pep_section(config_path: str, name: str, mode: str) -> None:
+    """The configuration's `pep` section: the name, the mode and the key; other members of the
+    section and of the file are kept."""
+    path = Path(config_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    section = raw.get("pep") if isinstance(raw.get("pep"), dict) else {}
+    section.update({"name": name, "mode": mode, "assertionKey": PEP_KEY_IN_SECTION})
+    raw["pep"] = section
+    path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+
+def setup_pep(api, get, files: dict, config_path: str, name: str, mode: str) -> None:
+    """docs/remote-pep.md's steps 2 to 6. Safe to run again: an account, a key and a policy that are
+    there are kept, and the binding is set again."""
+    from urllib.parse import quote
+
+    app = files["realm"]
+    # Step 2: the service account, in remote-peps.
+    made_account = get(f"/users?user={quote(name)}").get("known") is not True
+    if made_account:
+        _ok(api("/users/create", {"username": name, "invent": False, "credential": "none", "serviceAccount": True,
+                                  "owners": ["admin-write"], "attributes": {"cn": name, "displayName": name}}),
+            f"creating the service account {name}")
+        print(f"Created the PEP's service account {name}.")
+    else:
+        print(f"The PEP's service account {name} already exists.")
+    _ok(api("/groups/add-member", {"group": PEP_GROUP, "member": name}), f"adding {name} to {PEP_GROUP}", allow="already")
+    # Step 3: the key, certified from its own request, and the binding.
+    key_file = Path(config_path).resolve().parent / PEP_KEY
+    made_key = not key_file.exists()
+    if made_key:
+        make_pep_key(key_file)
+        print(f"Generated the PEP's P-256 key in {key_file} (readable by you only).")
+    if made_key or made_account:
+        _ok(api("/xacml/issue-pep-credential", {"name": name, "csr": pep_csr(key_file, name), "application": app}),
+            "certifying the PEP's key")
+        print(f"Certified the PEP's key and bound {name} to {app}.")
+    else:
+        _ok(api("/xacml/set-pep-application", {"name": name, "application": app}), f"binding {name} to {app}")
+        print(f"Kept the PEP's key; {name} is bound to {app}.")
+    # Step 4: the claim the policy reads.
+    _ok(api("/xacml/authzen/set-attribute", {"object": "subject", "property": "acr", "attributeId": ACR_ATTRIBUTE}),
+        "the catalogue row subject.acr")
+    # Step 5: the application's own policy, written only while it enforces none, so an
+    # administrator's edits survive a re-run. The realm root is never touched.
+    page_path = f"/applications?application={quote(app, safe='')}"
+    page = get(page_path).get("page") or {}
+    fga = page.get("fga") or {}
+    if fga.get("enforced") is True:
+        print(f"{app} already enforces its own policy; it is left as it is.")
+    else:
+        _ok(api("/applications/fga-create-policy", {"application": app}), f"{app}'s own policy", allow="already")
+        page = get(page_path).get("page") or {}
+        fga = page.get("fga") or {}
+        policy = (fga.get("policy") or {}).get("name") or fga.get("reference")
+        if not policy:
+            raise RuntimeError(f"{app}'s page names no policy of its own: {json.dumps(fga)[:300]}")
+        _ok(api("/xacml/import-alfa", {"name": policy, "alfa": orders_policy()}), f"writing {policy}")
+        _ok(api("/applications/fga-enable", {"application": app}), f"enforcing {app}'s own policy")
+        print(f"{app} now enforces its own policy {policy}: read on an order needs an acr; anything else is denied.")
+    # Step 6: only an application that restricts its streams needs the event named.
+    allowed = (page.get("attributes") or {}).get("ssfAllowedEvents") or []
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    if allowed and PEP_EVENT not in allowed:
+        _ok(api("/applications/add", {"application": app, "attribute": "ssfAllowedEvents", "value": PEP_EVENT}),
+            "letting pep-policies-changed through ssfAllowedEvents", allow="already")
+        print(f"Added {PEP_EVENT} to {app}'s ssfAllowedEvents.")
+    write_pep_section(config_path, name, mode)
+    print(f"Wrote a {mode} pep section into {config_path}.")
+
+
 def _generate_keys(config_path: str) -> None:
     """Run this crate's `wsfed-caep generate-keys`. It is on PATH in the demo image.
 
@@ -357,6 +554,9 @@ def main(argv: list[str] | None = None) -> None:
             print(f"{call['method']} {call['path']}  # {call['why']}")
             if call.get("body") is not None:
                 print(json.dumps(call["body"], indent=2))
+        if args["pep"]:
+            for line in pep_plan(files, base, args["pep_name"], args["pep"]):
+                print(line)
         return
     if not Path(files["key"]).exists() and not Path(files["cert"]).exists():
         print("No key pair yet; generating one.")
@@ -421,6 +621,11 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Saved the IdP metadata to {files['idp_metadata']}")
     if args["test_user"]:
         _ensure_user(base, ca, token, args["test_user"], api, Path(args["config"]).resolve().parent / "generated")
+    if args["pep"]:
+        def get(path: str) -> dict:
+            return _json(f"{base}/admin-api{path}", ca, headers={"accept": "application/json", "authorization": f"Bearer {token}"})["body"]
+        setup_pep(api, get, files, args["config"], args["pep_name"], args["pep"])
+        print(f"pep:  {args['pep_name']}, {args['pep']} (GET /orders/<id> needs a sign-in with an acr; any other method is denied)")
     print("Done. Start the demo with: docker compose up --build")
 
 

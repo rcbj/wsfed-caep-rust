@@ -96,7 +96,19 @@ The defaults are 18517 for iya-sts and 18617 for the demo. Do not bind host port
 
 iya-sts main sets the WS-Federation assertion SessionIndex to the assertion id. The CAEP session-revoked subject names the sign-on session, so the index finds nobody. The demo ends its one session from the event handler (`App::remember` in `src/demo.rs`), as the Java demo does in `Demo.java`.
 
+`--pep` (or `LIVE_PEP=1`) adds the embedded PEP; it needs `IYA_STS_IMAGE` built with iya-sts #2026–#2028. The install script sets the PEP up (`--pep central`), and a copy of the configuration says `local`. Central: `GET /orders/42` 200 and `POST /orders/42` 403. Local: the same, then the application's own policy is rewritten to deny read, and the GET must turn 403 by the `pep-policies-changed` event within 30 s. The install script may be run again against the same iya-sts; the live script always starts a fresh one.
+
 [`.github/workflows/nightly.yml`](.github/workflows/nightly.yml) runs `docker build --target test .` and then the live script at 07:06 UTC (`6 7 * * *`), and on `workflow_dispatch`. Push and pull-request CI stays in `tests.yml`.
+
+## Demo with its embedded PEP
+
+One command registers the demo and sets up its PEP (the demo image builds with `local`):
+
+```sh
+ADMIN_API_CLIENT_SECRET=... python3 scripts/configure_iya_sts.py --idp https://localhost:8443 --pep central
+```
+
+It needs an iya-sts with embedded-PEP support (iya-sts #2026–#2028) and the host's `openssl`. Beside the registration it creates the PEP's service account (`pep-wsfed-demo`, or `--pep-name`) in `remote-peps`, makes its P-256 key in `demo/generated/pep-key.pem` (0600, never printed, never in the image), certifies it bound to the demo's application, adds the catalogue row for `acr`, gives the application its own enforced policy (read on an order needs an `acr`; anything else is denied; the realm root is never touched), and writes the `pep` section into `demo/wsfed.json`. Mount the key into the container beside `rp.key`. Run it again with `--pep local` to switch modes: the account, key and policy are kept. [docs/remote-pep.md](docs/remote-pep.md#the-demo) has the details.
 
 ## Layout
 

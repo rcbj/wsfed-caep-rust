@@ -30,6 +30,8 @@ api() { curl -s -H "Authorization: Bearer $TOKEN" \
 
 Register the WS-Federation relying party in iya-sts as usual; `scripts/configure_iya_sts.py` does it for the demo. Note its identifier: it is the `application` the PEP is bound to (`realm` (the wtrealm) by default).
 
+**For the demo, one command does steps 1 to 6**: `python3 scripts/configure_iya_sts.py --pep central` (or `local`); see *The demo* below.
+
 ### 2. Create the PEP's service account
 
 The PEP signs in as a service account of its own, never as a person or as the application:
@@ -224,7 +226,17 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 
 ## The demo
 
-Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/wsfed.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`.
+Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/wsfed.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`. A GET is `read` and any other method `write`. `GET /live-status` carries the PEP's `status()` under `pep`.
+
+The install script sets the demo up with its PEP in one command, after registering the relying party:
+
+```bash
+ADMIN_API_CLIENT_SECRET=... python3 scripts/configure_iya_sts.py --idp https://localhost:8443 --pep central
+```
+
+It does steps 2 to 6 above through the management API: the service account `pep-wsfed-demo` (`--pep-name` to choose another) in `remote-peps`; a P-256 key made with your `openssl` in `demo/generated/pep-key.pem` (0600, never printed, kept out of the image by `.dockerignore`), certified with `issue-pep-credential` and bound to the demo's application; the catalogue row `subject.acr` → `urn:example:acr`; the application's **own** policy, enforced (`fga-create-policy`, `import-alfa`, `fga-enable`), which permits `read` on an `order` when the sign-in carried an `acr` and denies everything else; `pep-policies-changed` in `ssfAllowedEvents` if the application restricts its events. It never touches the realm root. Finally it writes the `pep` section (`name`, `mode`, `assertionKey: file:generated/pep-key.pem`) into `demo/wsfed.json`, keeping everything else. `--dry-run` lists the calls.
+
+Run it again, for example with `--pep local` to switch modes: the account, the key and the policy are kept (the policy is written only while the application enforces none, so your edits survive), the binding is set again, and only the mode changes. Against a fresh iya-sts with the key file kept, the existing key is certified. Mount `demo/generated/pep-key.pem` into the demo container beside the relying party's key.
 
 ## Testing that both modes agree
 
