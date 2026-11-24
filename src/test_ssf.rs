@@ -54,6 +54,9 @@ struct State {
     created: i64,
     streams: Vec<Value>,
     jwk: Map<String, Value>,
+    /// Every PATCH body, and whether PATCH is refused (405).
+    patches: Vec<Value>,
+    refuse_patch: bool,
 }
 
 pub(crate) struct Stub {
@@ -74,6 +77,22 @@ impl Stub {
     /// The ids the receiver refused (`setErrs`).
     pub(crate) fn refused(&self) -> Vec<String> { self.state.lock().unwrap().errs.keys().cloned().collect() }
 
+    #[cfg(feature = "pep")]
+    /// A poll stream that already exists: GET lists it, PATCH merges into it.
+    pub(crate) fn add_stream(&self, stream: Value) { self.state.lock().unwrap().streams.push(stream); }
+
+    #[cfg(feature = "pep")]
+    /// How many streams POST created.
+    pub(crate) fn created(&self) -> i64 { self.state.lock().unwrap().created }
+
+    #[cfg(feature = "pep")]
+    /// Every PATCH body received.
+    pub(crate) fn patches(&self) -> Vec<Value> { self.state.lock().unwrap().patches.clone() }
+
+    #[cfg(feature = "pep")]
+    /// Answer every PATCH 405 from now on.
+    pub(crate) fn refuse_patch(&self) { self.state.lock().unwrap().refuse_patch = true; }
+
     pub(crate) fn new() -> Self {
         let key = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
         let other = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
@@ -87,6 +106,8 @@ impl Stub {
             created: 0,
             streams: Vec::new(),
             jwk: jwk_of(&key, "k1"),
+            patches: Vec::new(),
+            refuse_patch: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let state_for = state.clone();
@@ -159,6 +180,24 @@ fn answer(state: &Mutex<State>, url: &str, method: &str, path: &str, body: &[u8]
     }
     if path == "/ssf/stream" && method == "GET" {
         return (200, Value::Array(state.streams.clone()));
+    }
+    if path == "/ssf/stream" && method == "PATCH" {
+        let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        state.patches.push(parsed.clone());
+        if state.refuse_patch {
+            return (405, json!({"err": "method_not_allowed"}));
+        }
+        let Some(stream) = state.streams.iter_mut().find(|item| item["stream_id"] == parsed["stream_id"]) else {
+            return (404, json!({"err": "not found"}));
+        };
+        if let Some(events) = parsed.get("events_requested") {
+            stream["events_requested"] = events.clone();
+            stream["events_delivered"] = events.clone();
+        }
+        // An answer without delivery: the receiver keeps the one it listed.
+        let mut answer = stream.clone();
+        answer.as_object_mut().unwrap().remove("delivery");
+        return (200, answer);
     }
     if path == "/ssf/stream" && method == "POST" {
         let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);

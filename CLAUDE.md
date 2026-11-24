@@ -55,6 +55,7 @@ iya-sts#1206 work item 8, behind the `pep` feature (`local` adds the engine). `s
 - `src/test_pep.rs` has its own stub PDP (tiny_http) and reuses `test_ssf.rs`'s transmitter stub.
 - **The dependency is a git dependency on iya-pep-rust's `feature/1`** until that crate's first release. Switch it to the crates.io version then, because crates.io refuses a git dependency at publish.
 - The live test of the PEP waits for iya-sts #2026–#2028.
+- oidc-caep-risc's live run (its #46) found two defects; both are held here by `src/test_pep.rs`. `from_file` keeps the `pep` section (`from_file_keeps_the_pep_section`; this library's reader always did). A reused poll stream gets the event types it lacks PATCHed in (`with_requested_events`); a refusal goes to the log's `error`, and `start` tells the PEP `set_event_stream(Requested)` or `Excluded` from the stream's events, which the heartbeat reports as `policyEvents` (`a_reused_stream_gets_the_policy_event_added`, with PATCH on `test_ssf.rs`'s stub).
 
 ## Layout
 

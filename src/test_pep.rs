@@ -202,6 +202,28 @@ mod with_pep {
         assert!(create(json!({"pep": null})).unwrap().pep().is_none(), "null is no section");
     }
 
+    /// `from_file` reads the `pep` section as `create` does, and the PEP it
+    /// builds is started: the live run of oidc-caep-risc (its #46) found that
+    /// library's file reader dropped the section, so this one is held to it
+    /// too.
+    #[test]
+    fn from_file_keeps_the_pep_section() {
+        let pdp = start_pdp();
+        let dir = std::env::temp_dir().join(format!("wsfed-pep-from-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pep-key.pem"), stub::idp_key()).unwrap();
+        let doc = cfg(json!({"pep": {"name": "pep-demo", "assertionKey": "file:pep-key.pem", "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000}}));
+        let path = dir.join("wsfed.json");
+        std::fs::write(&path, Value::Object(doc).to_string()).unwrap();
+        let rp = RelyingParty::from_file(&path.to_string_lossy(), None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let pep = rp.pep().expect("the configuration file's pep section built a PEP");
+        assert_eq!(pep.config().name, "pep-demo");
+        assert!(pep.config().assertion_key.ends_with("pep-key.pem") && Path::new(&pep.config().assertion_key).is_absolute(), "relative to the file's directory: {}", pep.config().assertion_key);
+        assert!(pep.status().running);
+        assert!(pdp.count("/xacml/pep/register") >= 1, "and started it");
+    }
+
     #[test]
     fn a_bad_section_is_refused_at_create() {
         let pdp = start_pdp();
@@ -398,6 +420,91 @@ mod with_pep {
         assert!(tx.acked().contains(&good));
         assert!(rp.decide(&login(), &access).is_permit());
         assert_eq!(pdp.count("/access/v1/evaluation"), 2, "the event cleared the cache");
+    }
+
+    /// Waits up to 10 s for a heartbeat whose `policyEvents` is `want`
+    /// (one built before the receiver started can still be on its way).
+    fn assert_policy_events(pdp: &Pdp, want: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let last = pdp.bodies("/xacml/pep/heartbeat").last().map(|beat| beat["policyEvents"].clone());
+            if last.as_ref().is_some_and(|value| value == want) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "no heartbeat said {want}; the last said {last:?}");
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    struct Errors(Mutex<Vec<String>>);
+    impl crate::ssf::SignalsLog for Errors {
+        fn info(&self, _: &str) {}
+        fn warn(&self, _: &str) {}
+        fn error(&self, message: &str) { self.0.lock().unwrap().push(message.to_string()); }
+    }
+
+    /// oidc-caep-risc's live run (#46): a stream made while the PEP was
+    /// `central` (no event asked for) was found and reused by the `local`
+    /// PEP's receiver, so iya-sts never sent it `pep-policies-changed`. A
+    /// reused stream now gets the missing type PATCHed in, and the PEP's
+    /// heartbeat says `requested`, or `excluded` when the transmitter won't.
+    #[test]
+    fn a_reused_stream_gets_the_policy_event_added() {
+        let pdp = start_pdp();
+        let caep = events::event("session_revoked");
+        let old = |tx: &Stub, id: &str| json!({
+            "stream_id": id, "iss": tx.url, "aud": "my-app",
+            "delivery": {"method": "urn:ietf:rfc:8936", "endpoint_url": format!("{}/ssf/poll/{id}", tx.url)},
+            "events_requested": [caep], "events_delivered": [caep]
+        });
+        let errors = Arc::new(Errors(Mutex::new(Vec::new())));
+        let receiver_for = |tx: &Stub, rp: &RelyingParty| SignalsReceiver::new(&tx.url, Arc::new(|_, _| Ok(())), ReceiverOptions {
+            poll_interval_ms: 60_000,
+            log: Some(errors.clone() as Arc<dyn crate::ssf::SignalsLog>),
+            pep: rp.pep().cloned(),
+            ..ReceiverOptions::default()
+        }).unwrap();
+        // The section's signals false makes the PEP start out reporting
+        // `none`: a `requested` heartbeat can only come from the receiver.
+        let rp = create(json!({"pep": pep_section(pdp, "reuse", json!({"permitCacheMs": 30000, "heartbeatIntervalMs": 1000, "signals": false}))})).unwrap();
+        let tx = Stub::new();
+        tx.add_stream(old(&tx, "old"));
+        let receiver = receiver_for(&tx, &rp);
+        let _stop = Stop(receiver.clone());
+        receiver.start().unwrap();
+        receiver.stop();
+        assert_eq!(tx.created(), 0, "the stream was reused, not made again");
+        let patches = tx.patches();
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        assert_eq!(patches[0]["stream_id"], "old");
+        let asked: Vec<&str> = patches[0]["events_requested"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(asked.contains(&caep), "what it asked for before is kept: {asked:?}");
+        assert!(asked.contains(&POLICIES_CHANGED_EVENT), "the policy event is added: {asked:?}");
+        let stream = receiver.stream();
+        assert!(stream["events_delivered"].as_array().unwrap().iter().any(|e| e == POLICIES_CHANGED_EVENT));
+        assert_eq!(stream["delivery"]["endpoint_url"], format!("{}/ssf/poll/old", tx.url), "the delivery the listing gave is kept");
+        assert!(errors.0.lock().unwrap().is_empty(), "{:?}", errors.0.lock().unwrap());
+        assert_policy_events(pdp, "requested");
+
+        // Nothing missing: no PATCH.
+        let again = receiver_for(&tx, &rp);
+        let _stop_again = Stop(again.clone());
+        again.start().unwrap();
+        again.stop();
+        assert_eq!(tx.patches().len(), 1, "a stream that already carries the event is left alone");
+
+        // A transmitter that refuses: the receiver still starts, says so,
+        // and the PEP's heartbeat reports the event excluded.
+        let tx = Stub::new();
+        tx.refuse_patch();
+        tx.add_stream(old(&tx, "fixed"));
+        let refused = receiver_for(&tx, &rp);
+        let _stop_refused = Stop(refused.clone());
+        refused.start().unwrap();
+        refused.stop();
+        assert_eq!(tx.patches().len(), 1);
+        assert!(errors.0.lock().unwrap().iter().any(|l| l.contains("answered 405")), "{:?}", errors.0.lock().unwrap());
+        assert_policy_events(pdp, "excluded");
     }
 
     #[test]
