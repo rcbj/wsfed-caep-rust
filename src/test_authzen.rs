@@ -39,6 +39,9 @@ use crate::token::Login;
 
 const ACCESS_SUBJECT: &str = "urn:oasis:names:tc:xacml:1.0:subject-category:access-subject";
 const XS_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+/// The entry DN the stub's registration answer names, as iya-sts names a
+/// PEP's service account.
+const STUB_PEP_DN: &str = "uid=pep-wsfed-authzen,ou=users,dc=example,dc=com";
 
 fn table() -> Value {
     serde_json::from_str(include_str!("test_authzen.json")).expect("src/test_authzen.json is JSON")
@@ -258,6 +261,9 @@ struct Pdp {
     rows: Value,
     directory: Value,
     policies: Mutex<(String, Vec<Value>)>,
+    /// The catalogue's `fgaApplications`: the bound application in the
+    /// `application` phase, where it enforces fine-grained authorization.
+    fga_applications: Mutex<Vec<String>>,
     evaluations: AtomicUsize,
 }
 
@@ -269,6 +275,7 @@ fn start_pdp(table: &Value) -> &'static Pdp {
         rows: table["catalogue"].clone(),
         directory: table["directory"].clone(),
         policies: Mutex::new((String::new(), Vec::new())),
+        fga_applications: Mutex::new(Vec::new()),
         evaluations: AtomicUsize::new(0),
     }));
     thread::spawn(move || {
@@ -290,9 +297,14 @@ fn pdp_answer(pdp: &Pdp, path: &str, body: &str) -> (u16, &'static str, String) 
     let ok = |value: Value| (200, "application/json", value.to_string());
     match path {
         "/oauth2/token" => ok(json!({"access_token": "pep-token", "token_type": "DPoP", "expires_in": 300})),
-        "/xacml/pep/register" => (201, "application/json", json!({"registered": true}).to_string()),
+        // The service answers the PEP's entry DN, which `local` writes as
+        // the caller fact.
+        "/xacml/pep/register" => (201, "application/json", json!({"registered": true, "identity": STUB_PEP_DN}).to_string()),
         "/xacml/pep/heartbeat" => ok(json!({"acknowledged": true, "current": true})),
-        "/xacml/pep/authzen-catalogue" => ok(json!({"syncToken": "authzen-rows", "rows": pdp.rows, "settings": {"obligationsProfile": true}})),
+        "/xacml/pep/authzen-catalogue" => {
+            let fga = pdp.fga_applications.lock().unwrap().clone();
+            ok(json!({"syncToken": format!("authzen-rows-{}", fga.len()), "rows": pdp.rows, "fgaApplications": fga, "settings": {"obligationsProfile": true}}))
+        }
         "/xacml/pep/policies" => {
             let (token, policies) = pdp.policies.lock().unwrap().clone();
             let root = policies.iter().find(|p| p["isRoot"] == true).map(|p| p["name"].clone()).unwrap_or(Value::Null);
@@ -372,6 +384,7 @@ fn every_case_answers_as_the_table_says_in_local_mode() {
     let mut ran = 0;
     for phase in table["phases"].as_array().unwrap().iter().filter_map(Value::as_str) {
         *pdp.policies.lock().unwrap() = (format!("authzen-{phase}"), pulled_policies(&table, phase, REALM));
+        *pdp.fga_applications.lock().unwrap() = if phase == "application" { vec![REALM.to_string()] } else { Vec::new() };
         let config = json!({
             "realm": REALM, "replyUrl": REPLY, "signals": false,
             "idpMetadata": stub::idp_metadata(&MetaOptions::default()),
@@ -381,7 +394,8 @@ fn every_case_answers_as_the_table_says_in_local_mode() {
             },
         });
         let party = RelyingParty::create(config.as_object().unwrap(), Path::new(".")).unwrap();
-        wait_for(&party, "held the policy", |s| s.holds_policy);
+        // Registered too: the caller fact is the DN the registration answered.
+        wait_for(&party, "registered and held the policy", |s| s.registered && s.holds_policy);
         for case in cases(&table, phase) {
             ran += 1;
             let decision = run_case(&table, &party, &receiver, case, REALM);

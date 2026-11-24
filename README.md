@@ -79,7 +79,7 @@ IYA_STS_IMAGE=<an iya-sts image with #2026-#2028> python3 scripts/live_authzen.p
 python3 scripts/live_authzen.py --compile   # after changing the table's ALFA
 ```
 
-It provisions the application, two PEPs (`central` and `local`), the catalogue and the policies, runs every case through both (`authzen_live`, in Docker), and fails when they differ or either differs from the table. Its last output is JSON with the cases run, how many were equal and as expected, and each mismatch. Ports as below (18517; never 3000, 8081, 18481 to 18495).
+It provisions the application, two PEPs (`central` and `local`), the catalogue and the policies, runs every case through both (`authzen_live`, in Docker), and fails when they differ or either differs from the table. Its last output is JSON with the cases run, how many were equal and as expected, and each mismatch. Against iya-sts feature/2028 with the reference fix (`iya-sts:live-2028-fga`) and iya-pep c0d61ca: 52 cases, 52 equal, 52 as expected. Ports as below (18517; never 3000, 8081, 18481 to 18495).
 
 `cargo test` covers the stub IdP (a signed SAML assertion the library accepts), replay, metadata, the self-signed certificate, the SSF poll receiver, the setup script's signals behavior, and the demo handler. No live iya-sts. XML signatures use exclusive canonicalization from `ua-cryptography-xml-c14n` and an RSA-SHA256 check in this crate. rsa-sha256 is `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`. Status success is `urn:oasis:names:tc:SAML:2.0:status:Success`. Bearer confirmation is `urn:oasis:names:tc:SAML:2.0:cm:bearer`. This tree does not wrap another WS-Federation relying party and does not need libxml2.
 
