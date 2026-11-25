@@ -208,6 +208,8 @@ let receiver = SignalsReceiver::new(&transmitter_url, on_end, ReceiverOptions {
 
 The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-policies-changed`, verifies each SET like every other one, and hands the event to the PEP. A stream that already exists (made before the `pep` section was added, or while the PEP was `central`) is updated with `PATCH` to ask for the event too; if the transmitter refuses, the receiver still starts, the refusal goes to the receiver's log (`ReceiverOptions::log`, at `error`), and the PEP's heartbeat reports the event as `excluded`. The event is only a hint: the PEP pulls with its own credential and never trusts the event's contents. An event naming another PEP is ignored.
 
+The same receiver tells the transmitter which people it cares about. When a local session starts it calls Add Subject, and when a person's last local session ends (sign-out, or a session an event ended) it calls Remove Subject. The calls follow SSF 1.0 §8.1.3.2–8.1.3.3 and are made only when the transmitter publishes those endpoints. A refusal is logged and never fails the sign-in. `ReceiverOptions::add_subjects` (default true) turns this off; the README's *Subjects* paragraph has the details.
+
 The receiver keeps the PEP's view of the stream current: `requested` (or `excluded`) when it starts and after each poll that succeeds, `down` after a poll that fails and once `stop()` is called. A `local` PEP polls at `pollIntervalMs` while the stream is not `requested`, so a change still arrives while the stream cannot carry it, and the heartbeat reports the state as `policyEvents`.
 
 ## Operate it
