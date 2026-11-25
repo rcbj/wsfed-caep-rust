@@ -2,7 +2,7 @@
 
 This library can ask iya-sts's authorization policy whether a signed-in person (the `Login` `handle_reply` returned) may do something to a resource in your application, through an embedded **Remote PEP** (Policy Enforcement Point). The PEP itself is the shared [`iya-pep`](https://github.com/rcbj/iya-pep-rust) crate; this library builds it from your configuration, turns its WS-Federation sign-in into the PEP's subject, and hands it policy-change events from its Shared Signals stream. The design is [iya-sts #1206](https://github.com/rcbj/iya-sts/issues/1206).
 
-The PEP never permits by default. A decision is `Permit`, `Deny` or `Unavailable`, and `Unavailable` (no policy held yet, or iya-sts unreachable) must be treated as a refusal.
+The PEP never permits by default. A decision is `Permit`, `Deny` or `Unavailable`, and `Unavailable` (no policy held yet, iya-sts unreachable or answering badly, an engine fault, or a panic while deciding, which the PEP catches) must be treated as a refusal. Every PEP failure is a 403: `Decision::http_status()` is 200 for a Permit and 403 for a Deny and an `Unavailable` alike.
 
 ## Choosing a mode
 
@@ -11,7 +11,7 @@ The PEP never permits by default. A decision is `Permit`, `Deny` or `Unavailable
 | Who decides | iya-sts, per request (`POST /access/v1/evaluation`) | this process, with the PEP's own XACML engine |
 | Cargo feature | `pep` | `local` |
 | Latency | one HTTPS round trip per decision | none after the first pull |
-| When iya-sts is down | every decision is `Unavailable` | decisions continue with the policies held |
+| When iya-sts is down | every decision is `Unavailable`, and a Permit cache is emptied | decisions continue with the policies held |
 | Policy changes | at once | on the `pep-policies-changed` event, or the next poll |
 | Decision records | written by iya-sts | sent by the PEP to iya-sts's audit log |
 
@@ -141,11 +141,11 @@ Add a `pep` section to `wsfed.json`. The PEP is off unless it is present.
 | `pdpUrl` | the identity provider's metadata entityID. iya-sts publishes its realm's issuer there, which is the service's base with the `/realm/<id>` prefix | iya-sts, with `/realm/<id>` for a realm. |
 | `application` | `realm` (the wtrealm) | The application the PEP is bound to (step 3). |
 | `clientId` | `sts-remote-pep` | The client the PEP's assertion is presented through. |
-| `signals` | the library's `signals` | Whether a signal stream hands over policy-change events. Without one, `local` polls at `pollIntervalMs`. |
-| `pollIntervalMs` | 15000 | `local` without a signal stream. |
-| `fallbackPollMs` | 300000 | `local` with one, in case an event is lost. |
+| `signals` | the library's `signals` | Whether a signal stream hands over policy-change events. With it on, the PEP starts as `down` until the receiver reports the stream. |
+| `pollIntervalMs` | 15000 | `local`: the poll period while the stream does not carry the event (no stream, `down` or `excluded`). |
+| `fallbackPollMs` | 300000 | `local`: the poll period while the stream carries the event (`requested`), in case one is lost. |
 | `heartbeatIntervalMs` | 30000 | How often the PEP reports to iya-sts. |
-| `permitCacheMs` | 0 (off) | `central` only: reuse a Permit for this long, at most 60000. The policy-change event clears it. |
+| `permitCacheMs` | 0 (off) | `central` only: reuse a Permit for this long, at most 60000. The policy-change event clears it, and so does a failed evaluation or heartbeat: none is served again until iya-sts answers an evaluation. |
 | `supportedObligations` | `[]` | The obligation types your application discharges (see *Obligations*). |
 | `decisionRecords` | `true` | `local`: send each decision to iya-sts's audit log. |
 | `tlsCa` | `idpCa` | PEM trust anchors for iya-sts's TLS. |
@@ -172,6 +172,8 @@ match decision {
 // Without a receiver: party.decide(&login, &access)
 ```
 
+Answer the request with `decision.http_status()` rather than your own mapping, so a failure can never become anything but a 403. Whether the person is signed in at all (a 401) is your question, asked before the PEP's.
+
 `Access::new(action, resource_type, resource_id)` carries the AuthZEN action and resource. Add `resource_properties`, `action_properties` or `context` members as your policy needs them, each declared in the catalogue (step 4). The PEP always sets `context.application` to the bound application, whatever you put there.
 
 **The subject** comes from the sign-in, never from a request header:
@@ -183,7 +185,7 @@ Only the properties the catalogue declares are sent.
 
 **Ended sessions.** `party.decide_session(&receiver, session_id, &login, &access)` is a Deny without asking when the session isn't tracked, is past its expiry, was ended by a Shared Signals event such as CAEP `session-revoked`, or is past the assertion's `SessionNotOnOrAfter`.
 
-**Without a `pep` section**, every decision is `Unavailable`.
+**Without a `pep` section**, every decision is `Unavailable` (a 403).
 
 ### Obligations
 
@@ -206,6 +208,8 @@ let receiver = SignalsReceiver::new(&transmitter_url, on_end, ReceiverOptions {
 
 The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-policies-changed`, verifies each SET like every other one, and hands the event to the PEP. A stream that already exists (made before the `pep` section was added, or while the PEP was `central`) is updated with `PATCH` to ask for the event too; if the transmitter refuses, the receiver still starts, the refusal goes to the receiver's log (`ReceiverOptions::log`, at `error`), and the PEP's heartbeat reports the event as `excluded`. The event is only a hint: the PEP pulls with its own credential and never trusts the event's contents. An event naming another PEP is ignored.
 
+The receiver keeps the PEP's view of the stream current: `requested` (or `excluded`) when it starts and after each poll that succeeds, `down` after a poll that fails and once `stop()` is called. A `local` PEP polls at `pollIntervalMs` while the stream is not `requested`, so a change still arrives while the stream cannot carry it, and the heartbeat reports the state as `policyEvents`.
+
 ## Operate it
 
 - **Health.** `pep().unwrap().status()` reports whether the PEP is registered and running, whether it holds a policy (and which sync token), its decision counters and its current problems. It holds no secret, so it's safe on a health page.
@@ -223,12 +227,12 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 | A registration refused with 400 (`STS-XACML-0340`) | The iya-sts release doesn't support this PEP's protocol version. Upgrade iya-sts or this library. |
 | `Deny` saying the evaluation was refused (`local`: "refused (STS-AUTHZEN-0004)"; `central`: "the service refused the evaluation: invalid_request …") | A resource, action or context property you sent has no catalogue row (step 4). Subject claims without a row are dropped, not refused. |
 | `Deny` although the policy should permit | The policy reads a claim that has no catalogue row, so it never arrives (step 4). Or a Permit carried an obligation type missing from `supportedObligations`. |
-| Policy changes take minutes to apply (`local`) | The stream doesn't carry the event: check the console's *policy-change events* column, `ssfAllowedEvents` (step 6), and the receiver's log (`ReceiverOptions::log`, at `error`) for a refused stream update. |
+| Policy changes take minutes to apply (`local`) | The stream is `requested` but the event never arrives, so only the `fallbackPollMs` poll brings the change. The stream doesn't carry the event: check the console's *policy-change events* column, `ssfAllowedEvents` (step 6), and the receiver's log (`ReceiverOptions::log`, at `error`) for a refused stream update. |
 | The configuration is refused for the assertion key | It is one of this library's own keys. The PEP needs a key of its own. |
 
 ## The demo
 
-Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/wsfed.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, and 403 on a Deny and on `Unavailable` (any PEP failure is a 403: the page says the PEP could not decide). A GET is `read` and any other method `write`. `GET /attribute-protected` is decided the same way on `Access::new("read", "attribute-protected", "attr1")`: the demo application's policy permits it when the person's directory attribute `attr1` is `abc123`, which the PEP asks iya-sts's PIP for (it is not in the assertion); 401, 200, or 403 with the page saying which. Signed in, the top bar links Demo home, Attribute-protected and Order 42. `GET /live-status` carries the PEP's `status()` under `pep`.
+Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/wsfed.json` has a `pep` section: 401 without a sign-in, then the decision's `http_status()`: 200 on a Permit, and 403 on a Deny and on `Unavailable` (any PEP failure is a 403; the page says whether the PEP denied it or could not decide). A GET is `read` and any other method `write`. `GET /attribute-protected` is decided the same way on `Access::new("read", "attribute-protected", "attr1")`: the demo application's policy permits it when the person's directory attribute `attr1` is `abc123`, which the PEP asks iya-sts's PIP for (it is not in the assertion); 401, 200, or 403 with the page saying which. With a receiver running, both pages use `decide_session`, so a session an event ended is a Deny. Signed in, the top bar links Demo home, Attribute-protected and Order 42. `GET /live-status` carries the PEP's `status()` under `pep`.
 
 Its signed-in page has a **Policy enforcement** tab (`/?tab=pep`) showing what the PEP reports, refreshed every two seconds:
 
@@ -238,7 +242,7 @@ Its signed-in page has a **Policy enforcement** tab (`/?tab=pep`) showing what t
 - **Control plane:** heartbeats (last, next, failed), registrations, and decision records queued, sent and dropped.
 - **Try it:** links to `/orders/42` and `/attribute-protected`; the counters move as you try them.
 
-Each is a collapsible pane, and a pane you closed stays closed across the refresh (`demo/public/pep.js`, from `GET /pep-status.html`). `GET /pep-status` answers the same as JSON for a dashboard of your own. Both need a sign-in (401 otherwise) and carry nothing secret. Every number comes from `pep().unwrap().status()`, which your application can read the same way. Without a `pep` section the tab says there is no embedded PEP. The receiver keeps the PEP's view of the stream current: `requested` or `excluded` when it starts and after each good poll, `down` after a failed poll and once stopped, so the PEP polls for policy while it cannot hear the event.
+Each is a collapsible pane, and a pane you closed stays closed across the refresh (`demo/public/pep.js`, from `GET /pep-status.html`). `GET /pep-status` answers the same as JSON for a dashboard of your own. Both need a sign-in (401 otherwise) and carry nothing secret. Every number comes from `pep().unwrap().status()`, which your application can read the same way. Without a `pep` section the tab says there is no embedded PEP. *Policy-change events on the stream* is the state the receiver reports (see *Receive policy-change events*).
 
 The install script sets the demo up with its PEP in one command, after registering the relying party:
 
@@ -246,9 +250,11 @@ The install script sets the demo up with its PEP in one command, after registeri
 ADMIN_API_CLIENT_SECRET=... python3 scripts/configure_iya_sts.py --idp https://localhost:8443 --pep central
 ```
 
-It does steps 2 to 6 above through the management API: the service account `pep-wsfed-demo` (`--pep-name` to choose another) in `remote-peps`; a P-256 key made with your `openssl` in `demo/generated/pep-key.pem` (0600, never printed, kept out of the image by `.dockerignore`), certified with `issue-pep-credential` and bound to the demo's application; the catalogue row `subject.acr` → `urn:example:acr`; the application's **own** policy, enforced (`fga-create-policy`, `import-alfa`, `fga-enable`), which permits `read` on an `order` when the sign-in carried an `acr`, and `read` on `attribute-protected` when the person's directory attribute `attr1` is `abc123` (the PEP asks iya-sts's PIP for it; the script gives the test user that value, defining `attr1` with an `admin:security` token), and denies everything else; `pep-policies-changed` in `ssfAllowedEvents` if the application restricts its events. It never touches the realm root. Finally it writes the `pep` section (`name`, `mode`, `assertionKey: file:generated/pep-key.pem`) into `demo/wsfed.json`, keeping everything else. `--dry-run` lists the calls.
+It does steps 2 to 6 above through the management API (a bare `--pep` is `local`): the service account `pep-wsfed-demo` (`--pep-name` to choose another) in `remote-peps`; a P-256 key made with your `openssl` in `demo/generated/pep-key.pem` (0600, never printed, kept out of the image by `.dockerignore`), certified with `issue-pep-credential` and bound to the demo's application; the catalogue row `subject.acr` → `urn:example:acr`; the application's **own** policy, enforced (`fga-create-policy`, `import-alfa`, `fga-enable`), which permits `read` on an `order` when the sign-in carried an `acr`, and `read` on `attribute-protected` when the person's directory attribute `attr1` is `abc123`, and denies everything else; `pep-policies-changed` in `ssfAllowedEvents` if the application restricts its events. It never touches the realm root. Finally it writes the `pep` section (`name`, `mode`, `assertionKey: file:generated/pep-key.pem`) into `demo/wsfed.json`, keeping everything else. `--dry-run` lists the calls.
 
-Run it again, for example with `--pep local` to switch modes: the account and the key are kept, and the policy too unless it is the script's own (PolicyId `urn:example:wsfeddemo-orders`), which is rewritten to the current version; a policy under any other PolicyId is left alone, so your edits survive, the binding is set again, and only the mode changes. Against a fresh iya-sts with the key file kept, the existing key is certified. Mount `demo/generated/pep-key.pem` into the demo container beside the relying party's key.
+With a test user (the default, `wsfed-demo-user`; with or without `--pep`), the script also gives that user `attr1=abc123`. Defining the realm's custom attribute `attr1` is a Security Administrator's change, so the script makes that one call with a second token carrying `admin:security` (iya-sts seeds the management client in `SECURITY_ADMIN`); if that is refused and the value cannot be set, it says what to add on the console and carries on.
+
+Run it again, for example with `--pep central` to switch modes: the account and the key are kept and the binding is set again. The application's policy is rewritten to the script's current version while its PolicyId is the script's own (`urn:example:wsfeddemo-orders`); a policy under any other PolicyId is left as it is, so your edits survive. Against a fresh iya-sts with the key file kept, the existing key is certified. Compose mounts `demo/generated` (with `pep-key.pem`) into the demo container read-only.
 
 ## Testing that both modes agree
 
