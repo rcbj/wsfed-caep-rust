@@ -381,6 +381,43 @@ mod with_pep {
         assert_eq!(asked(), 1, "nothing ended was asked about");
     }
 
+    /// A stream that names subjects carries only events about them (iya-sts
+    /// under `default_subjects` ALL), and `pep-policies-changed` is about the
+    /// application: a receiver that adds people names the application too,
+    /// at `start`, as the event's `application` member.
+    #[test]
+    fn a_receiver_adding_subjects_names_the_application_its_pep_hears_about() {
+        let pdp = start_pdp();
+        let tx = Stub::new();
+        tx.subject_endpoints();
+        let local = create(json!({"pep": pep_section(pdp, "subjects", json!({"mode": "local"}))})).unwrap();
+        let receiver = SignalsReceiver::new(&tx.url, Arc::new(|_, _| Ok(())), ReceiverOptions { poll_interval_ms: 60_000, pep: local.pep().cloned(), ..ReceiverOptions::default() }).unwrap();
+        let _stop = Stop(receiver.clone());
+        receiver.start().unwrap();
+        let calls = tx.subject_calls();
+        assert_eq!(calls, vec![("add".to_string(), json!({"stream_id": "s1", "subject": {"format": "opaque", "id": REALM}, "verified": true}))]);
+        receiver.track("L1", &login(), None);
+        receiver.untrack("L1");
+        let calls = tx.subject_calls();
+        assert_eq!(calls.len(), 3, "the person added and removed: {calls:?}");
+        assert!(calls.iter().all(|(_, body)| body["subject"] != json!({"format": "opaque", "id": REALM}) || body.get("verified").is_some()), "the application is never removed");
+        receiver.stop();
+
+        // Switched off, or a PEP that wants no events (central, no Permit
+        // cache): the application is not named.
+        let tx = Stub::new();
+        tx.subject_endpoints();
+        let off = SignalsReceiver::new(&tx.url, Arc::new(|_, _| Ok(())), ReceiverOptions { poll_interval_ms: 60_000, add_subjects: false, pep: local.pep().cloned(), ..ReceiverOptions::default() }).unwrap();
+        off.start().unwrap();
+        off.stop();
+        let central = create(json!({"pep": pep_section(pdp, "subjects-central", json!({}))})).unwrap();
+        let quiet = SignalsReceiver::new(&tx.url, Arc::new(|_, _| Ok(())), ReceiverOptions { poll_interval_ms: 60_000, pep: central.pep().cloned(), ..ReceiverOptions::default() }).unwrap();
+        quiet.start().unwrap();
+        quiet.stop();
+        assert!(tx.subject_calls().is_empty(), "{:?}", tx.subject_calls());
+        local.pep().unwrap().stop();
+    }
+
     #[test]
     fn the_receiver_asks_for_the_policy_event_and_hands_it_to_the_pep() {
         let pdp = start_pdp();

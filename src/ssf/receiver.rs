@@ -65,7 +65,9 @@ pub struct ReceiverOptions {
     /// Tell the transmitter which subjects this receiver cares about (SSF 1.0
     /// sections 8.1.3.2 and 8.1.3.3): Add Subject when `track` starts a local
     /// session, Remove Subject when the last local session for that person
-    /// ends. Default true; skipped when the transmitter publishes no
+    /// ends; with `pep` (when it wants events), the application
+    /// (`{format: opaque, id}`) at `start`, so `pep-policies-changed` still
+    /// reaches a stream that names people. Default true; skipped when the transmitter publishes no
     /// `add_subject_endpoint` / `remove_subject_endpoint` or the receiver is
     /// not running. The demo reads it from `ssf.addSubjects`.
     pub add_subjects: bool,
@@ -289,16 +291,24 @@ impl SignalsReceiver {
     /// identifier for the person. Never retried, never an error to the caller.
     fn subject_call(&self, add: bool, session: &Session) {
         if !self.add_subjects || !self.running.load(Ordering::SeqCst) { return; }
-        let (endpoint, stream_id, issuer) = {
+        let issuer = text_of(&self.state.lock().unwrap().config, "issuer");
+        let Some(subject) = self.subject_of_session(session, &issuer) else { return };
+        self.send_subject(add, subject);
+    }
+
+    /// Add Subject or Remove Subject for `subject` on this stream, once;
+    /// the outcome is logged and counted (`subjects_health`).
+    fn send_subject(&self, add: bool, subject: Value) {
+        let (endpoint, stream_id) = {
             let state = self.state.lock().unwrap();
             let name = if add { "add_subject_endpoint" } else { "remove_subject_endpoint" };
-            (text_of(&state.config, name), text_of(&state.stream, "stream_id"), text_of(&state.config, "issuer"))
+            (text_of(&state.config, name), text_of(&state.stream, "stream_id"))
         };
         if endpoint.is_empty() || stream_id.is_empty() { return; }
-        let Some(subject) = self.subject_of_session(session, &issuer) else { return };
         let mut body = json!({"stream_id": stream_id, "subject": subject});
-        // The person comes from a token this library verified, issued by the
-        // identity provider that is this transmitter (section 8.1.3.2).
+        // verified (section 8.1.3.2): a person comes from a token this library
+        // verified, issued by the identity provider that is this transmitter;
+        // the application is this receiver's own.
         if add { body["verified"] = Value::Bool(true); }
         let what = if add { "adding" } else { "removing" };
         let format = body["subject"]["format"].as_str().unwrap_or("").to_string();
@@ -363,6 +373,18 @@ impl SignalsReceiver {
         *self.stop_tx.lock().unwrap() = Some(stop_tx);
         *self.done_rx.lock().unwrap() = Some(done_rx);
         self.running.store(true, Ordering::SeqCst);
+        // A transmitter narrows a stream that names subjects to those
+        // subjects (iya-sts under default_subjects ALL; SSF 1.0 8.1.3).
+        // `pep-policies-changed` is about the application the PEP is embedded
+        // in, a complex subject whose `application` member is
+        // {format: opaque, id: <application>}; once people are added, the
+        // stream would stop carrying it unless the application is named too.
+        #[cfg(feature = "pep")]
+        if self.add_subjects {
+            if let Some(pep) = &self.pep {
+                self.send_subject(true, json!({"format": "opaque", "id": pep.config().application}));
+            }
+        }
         let this = Arc::clone(self);
         let handle = thread::spawn(move || {
             this.loop_poll(stop_rx);
