@@ -29,7 +29,7 @@ pub use relying_party::{LoginOptions, LoginRequest, RelyingParty, ReplyBody, Rep
 pub use signature::sign_enveloped;
 pub use ssf::{events, SignalsReceiver};
 pub use token::Login;
-pub use x509util::{create_self_signed_key_pair, KeyPair};
+pub use x509util::{create_named_key_pair, create_self_signed_key_pair, CertificateName, KeyPair};
 
 pub fn from_file(path: &str, overrides: Option<serde_json::Map<String, serde_json::Value>>) -> Result<RelyingParty> {
     RelyingParty::from_file(path, overrides)

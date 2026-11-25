@@ -99,16 +99,36 @@ fn subject_public_key_bits(spki: &[u8]) -> Vec<u8> {
     spki[bits_body + 1..bits_end].to_vec()
 }
 
-fn der_name(common_name: &str) -> Vec<u8> {
-    let cn = common_name.as_bytes();
-    let utf8 = tlv(0x0c, &[cn]);
-    let oid_cn = oid("2.5.4.3");
-    let pair = seq(&[&oid_cn, &utf8]);
-    let one = set(&[&pair]);
-    seq(&[&one])
+/// A Name of one or two RDNs: `OU=<unit>` (when given) then `CN=<common_name>`.
+fn der_name(common_name: &str, unit: &str) -> Vec<u8> {
+    let rdn = |attribute: &str, value: &str| set(&[&seq(&[&oid(attribute), &tlv(0x0c, &[value.as_bytes()])])]);
+    if unit.is_empty() {
+        seq(&[&rdn("2.5.4.3", common_name)])
+    } else {
+        seq(&[&rdn("2.5.4.11", unit), &rdn("2.5.4.3", common_name)])
+    }
+}
+
+/// What a self-signed certificate is named: its common name, an optional
+/// organizational unit, and an optional subjectAltName URI.
+#[derive(Clone, Debug, Default)]
+pub struct CertificateName {
+    pub common_name: String,
+    pub unit: String,
+    pub uri: String,
 }
 
 pub fn create_self_signed_key_pair(common_name: &str, days: i64, bits: usize) -> Result<KeyPair> {
+    create_named_key_pair(&CertificateName { common_name: common_name.to_string(), ..CertificateName::default() }, days, bits)
+}
+
+/// A new RSA key and a self-signed certificate named by `name`: the subject
+/// `OU=<unit>, CN=<common_name>` (each at most 64 characters, RFC 5280's
+/// upper bounds) and, with a `uri`, a subjectAltName carrying it.
+pub fn create_named_key_pair(name: &CertificateName, days: i64, bits: usize) -> Result<KeyPair> {
+    let clip = |text: &str| text.chars().take(64).collect::<String>();
+    let common_name = clip(&name.common_name);
+    let unit = clip(&name.unit);
     let days = if days <= 0 { 1095 } else { days };
     let bits = if bits == 0 { 3072 } else { bits };
     let private_key = RsaPrivateKey::new(&mut OsRng, bits).map_err(|err| fail("config", err.to_string()))?;
@@ -125,9 +145,14 @@ pub fn create_self_signed_key_pair(common_name: &str, days: i64, bits: usize) ->
     let aki = seq(&[&oid("2.5.29.35"), &tlv(0x04, &[&aki_inner])]);
     let bc = seq(&[&oid("2.5.29.19"), &tlv(0x01, &[&[0xff]]), &tlv(0x04, &[&seq(&[])])]);
     let ku = seq(&[&oid("2.5.29.15"), &tlv(0x01, &[&[0xff]]), &tlv(0x04, &[&tlv(0x03, &[&[0x05, 0xa0]])])]);
-    let extensions = tlv(0xa3, &[&seq(&[&ski, &aki, &bc, &ku])]);
+    // subjectAltName: one uniformResourceIdentifier ([6] IA5String).
+    let san = (!name.uri.is_empty()).then(|| seq(&[&oid("2.5.29.17"), &tlv(0x04, &[&seq(&[&tlv(0x86, &[name.uri.as_bytes()])])])]));
+    let extensions = match &san {
+        Some(san) => tlv(0xa3, &[&seq(&[&ski, &aki, &bc, &ku, san])]),
+        None => tlv(0xa3, &[&seq(&[&ski, &aki, &bc, &ku])]),
+    };
     let sha256_rsa = seq(&[&oid("1.2.840.113549.1.1.11"), &[0x05, 0x00]]);
-    let name = der_name(common_name);
+    let name = der_name(&common_name, &unit);
     let times = seq(&[&der_time(not_before), &der_time(not_after)]);
     let version = tlv(0xa0, &[&tlv(0x02, &[&[0x02]])]);
     let serial_der = tlv(0x02, &[&serial]);
@@ -181,7 +206,32 @@ pub fn subject_cn(der: &[u8]) -> String {
     cn
 }
 
+/// The subject as RFC 4514 writes it, most specific first (`CN=…, OU=…`).
 pub fn subject_string(der: &[u8]) -> String {
-    let cn = subject_cn(der);
-    if cn.is_empty() { String::new() } else { format!("CN={cn}") }
+    let Ok((_, cert)) = X509Certificate::from_der(der) else { return String::new() };
+    let mut parts: Vec<String> = Vec::new();
+    for rdn in cert.subject().iter() {
+        for attribute in rdn.iter() {
+            let value = attribute.as_str().unwrap_or("").to_string();
+            let label = match attribute.attr_type().to_id_string().as_str() {
+                "2.5.4.3" => "CN".to_string(),
+                "2.5.4.11" => "OU".to_string(),
+                "2.5.4.10" => "O".to_string(),
+                other => other.to_string(),
+            };
+            parts.push(format!("{label}={value}"));
+        }
+    }
+    parts.reverse();
+    parts.join(", ")
+}
+
+/// The subjectAltName URIs of a certificate.
+pub fn subject_alt_uris(der: &[u8]) -> Vec<String> {
+    let Ok((_, cert)) = X509Certificate::from_der(der) else { return Vec::new() };
+    let Ok(Some(san)) = cert.subject_alternative_name() else { return Vec::new() };
+    san.value.general_names.iter().filter_map(|name| match name {
+        x509_parser::extensions::GeneralName::URI(uri) => Some(uri.to_string()),
+        _ => None,
+    }).collect()
 }
