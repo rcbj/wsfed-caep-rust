@@ -19,8 +19,9 @@
 //!     (`wsfedRealm`, the application's identifier), so the realm is the
 //!     application the PEP is bound to.
 //! - **Keys (D1).** The PEP's assertion key must differ from `privateKey`
-//!   (the relying party's one key: it signs the metadata, decrypts
-//!   assertions, and is the demo's Shared Signals client certificate key) and
+//!   (the relying party's key pair: it decrypts assertions and is the
+//!   receiver's TLS client identity only when `ssf.clientCertificate` is not
+//!   set; the demo's receiver uses a realm-issued certificate of its own) and
 //!   from the receiver's TLS client key. `RelyingParty::create` and
 //!   `SignalsReceiver::new` refuse a configuration where two have the same
 //!   JWK thumbprint.
