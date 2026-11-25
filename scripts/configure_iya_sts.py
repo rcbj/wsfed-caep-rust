@@ -19,7 +19,10 @@ the shell PORT. An explicit --public-url or PUBLIC_URL replaces the origin and k
 .dockerignore), issue-pep-credential binding it to the demo's application, the catalogue row the
 demo's policy reads (subject.acr), the application's OWN policy, which it then enforces (never the
 realm root), and a `pep` section in the configuration. Run it again to switch the mode: the
-account, the key and the policy are kept.
+account and the key are kept, and the policy is written again with the current rules while it
+is this script's own (OWN_POLICY_IDS); a policy under another PolicyId is left alone. The test
+user is given attr1=abc123 (a custom attribute, defined with an admin:security token), which
+GET /attribute-protected is decided on.
 
 Every run writes iya-sts's listener CA trust chain (leaf, TLS Issuing CA, Intermediate, Root) to the
 file idpCa names, through scripts/trust_chain.py. The demo image build copies that file in, so
@@ -126,8 +129,9 @@ def usage() -> str:
                   account, its key (generated/pep-key.pem beside the configuration, 0600, made
                   with openssl), its binding to the demo's application, the catalogue row and
                   the application's own policy (enforced), and a `pep` section written into the
-                  configuration. Run it again with the other mode to switch; the account, the
-                  key and the policy are kept.
+                  configuration. Run it again with the other mode to switch; the account and
+                  the key are kept, and the script's own policy (OWN_POLICY_IDS) is written
+                  again with the current rules (any other policy is left alone).
   --pep-name      The PEP's service account (default: pep-wsfed-demo).
   --dry-run       Print what would be done, and send nothing.
 
