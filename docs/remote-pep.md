@@ -226,7 +226,7 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 
 ## The demo
 
-Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/wsfed.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`. A GET is `read` and any other method `write`. `GET /live-status` carries the PEP's `status()` under `pep`.
+Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/wsfed.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, 403 on a Deny and 503 on `Unavailable`. A GET is `read` and any other method `write`. `GET /live-status` carries the PEP's `status()` under `pep`. The signed-in page has two tabs: **Session** (`/`, as before) and **Policy enforcement** (`/?tab=pep`), the embedded PEP's `status()` in four collapsible panes: Decisions, Cached policy, The PEP, and Control plane. `demo/public/pep.js` redraws it every 2 s from `GET /pep-status.html` and keeps a pane you closed closed; `GET /pep-status` is the same as JSON. Both need a sign-in (401 otherwise) and carry nothing secret. Without a `pep` section the tab says there is no embedded PEP.
 
 The install script sets the demo up with its PEP in one command, after registering the relying party:
 

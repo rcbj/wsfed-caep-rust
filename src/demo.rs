@@ -19,6 +19,11 @@ use std::sync::{Arc, Mutex};
 use tiny_http::{Header, Response, Server, StatusCode};
 
 const STYLES: &str = include_str!("../demo/public/styles.css");
+/// The Policy enforcement tab's refresh (every 2 s, keeping closed panes closed).
+const PEP_JS: &str = include_str!("../demo/public/pep.js");
+/// The pages' Content-Security-Policy. `connect-src 'self'` lets pep.js
+/// fetch `/pep-status.html`; there is no inline script or style.
+const CSP: &str = "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'";
 const GIF_B64: &str = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -90,7 +95,7 @@ impl App {
         (200, vec![("content-type".to_string(), "application/json".to_string()), ("cache-control".to_string(), "no-store".to_string())], body.to_string().into_bytes())
     }
 
-    fn sign(&self, value: &str) -> String {
+    pub(crate) fn sign(&self, value: &str) -> String {
         let mut mac = HmacSha256::new_from_slice(&self.secret).expect("hmac");
         mac.update(value.as_bytes());
         format!("{value}.{}", URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
@@ -171,12 +176,44 @@ impl App {
         if path == "/" && method == "GET" {
             let who = if sid.is_empty() { None } else { self.sessions.lock().unwrap().get(&sid).cloned() };
             let page = if let Some(who) = who {
-                format!("<p>Signed in as <strong>{}</strong> by {}.</p><form method=\"post\" action=\"/logout\"><button>Sign out</button></form>", esc(&who.name_id), esc(&who.issuer))
+                let session = format!("<p>Signed in as <strong>{}</strong> by {}.</p><form method=\"post\" action=\"/logout\"><button>Sign out</button></form>", esc(&who.name_id), esc(&who.issuer));
+                let tab = if query_param(target, "tab") == "pep" { "pep" } else { "session" };
+                let content = if tab == "pep" {
+                    format!("<div id=\"pep-panel\">{}</div><script src=\"/pep.js\" defer></script>", pep_fragment(&self.rp))
+                } else {
+                    session
+                };
+                let link = |id: &str, href: &str, label: &str| {
+                    let on = id == tab;
+                    format!("<a class=\"page-tab\" role=\"tab\" href=\"{href}\" aria-selected=\"{on}\"{}>{label}</a>", if on { " aria-current=\"page\"" } else { "" })
+                };
+                format!(
+                    "<nav class=\"page-tabs\" role=\"tablist\" aria-label=\"Sections\">{}{}</nav><div role=\"tabpanel\" id=\"panel\">{content}</div>",
+                    link("session", "/", "Session"),
+                    link("pep", "/?tab=pep", "Policy enforcement")
+                )
             } else {
                 "<p><a href=\"/login\">Sign in with WS-Federation</a></p>".to_string()
             };
             let html = format!("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>WS-Federation</title><link rel=\"stylesheet\" href=\"/styles.css\"></head><body><main>{page}</main></body></html>");
-            return (200, vec![("content-type".to_string(), "text/html; charset=utf-8".to_string())], html.into_bytes());
+            return (200, vec![("content-type".to_string(), "text/html; charset=utf-8".to_string()), ("content-security-policy".to_string(), CSP.to_string())], html.into_bytes());
+        }
+        if path == "/pep.js" && method == "GET" {
+            return (200, vec![("content-type".to_string(), "text/javascript; charset=utf-8".to_string())], PEP_JS.as_bytes().to_vec());
+        }
+        if (path == "/pep-status" || path == "/pep-status.html") && method == "GET" {
+            // For a signed-in browser only, like the page that shows it.
+            // Nothing in it is secret: counts, times, tokens naming policy
+            // versions, and the PEP key's public thumbprint.
+            if sid.is_empty() || !self.sessions.lock().unwrap().contains_key(&sid) {
+                return (401, vec![("content-type".to_string(), "text/plain; charset=utf-8".to_string())], b"sign in first".to_vec());
+            }
+            let no_store = ("cache-control".to_string(), "no-store".to_string());
+            return if path.ends_with(".html") {
+                (200, vec![("content-type".to_string(), "text/html; charset=utf-8".to_string()), no_store], pep_fragment(&self.rp).into_bytes())
+            } else {
+                (200, vec![("content-type".to_string(), "application/json".to_string()), no_store], pep_json(&self.rp).to_string().into_bytes())
+            };
         }
         #[cfg(feature = "pep")]
         if let Some(id) = path.strip_prefix("/orders/").filter(|id| !id.is_empty() && !id.contains('/')) {
@@ -239,6 +276,153 @@ fn cookies(header: &str) -> HashMap<String, String> {
         let Some((name, value)) = part.split_once('=') else { continue };
         if !name.is_empty() && !value.is_empty() && !out.contains_key(name) { out.insert(name.to_string(), value.to_string()); }
     }
+    out
+}
+
+/// One query parameter of a request target, decoded, or empty.
+pub(crate) fn query_param(target: &str, name: &str) -> String {
+    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+    url::form_urlencoded::parse(query.as_bytes()).find(|(k, _)| k == name).map(|(_, v)| v.into_owned()).unwrap_or_default()
+}
+
+/// The embedded PEP's `Status` as JSON (`GET /pep-status`), every time in
+/// milliseconds. It holds no secret.
+#[cfg(feature = "pep")]
+pub(crate) fn pep_json(rp: &RelyingParty) -> serde_json::Value {
+    use serde_json::json;
+    let Some(pep) = rp.pep() else {
+        return json!({"enabled": false, "why": "no pep section is configured"});
+    };
+    let s = pep.status();
+    let ms = |d: Option<std::time::Duration>| d.map(|d| d.as_millis() as u64);
+    json!({
+        "enabled": true,
+        "name": s.name, "mode": s.mode.as_str(), "application": s.application, "pdpUrl": s.pdp_url,
+        "protocolVersion": s.protocol_version, "registered": s.registered, "running": s.running,
+        "eventStream": s.event_stream.as_str(), "keyThumbprint": s.key_thumbprint, "problems": s.last_error,
+        "policy": {
+            "held": s.holds_policy, "count": s.policy_count, "syncToken": s.sync_token,
+            "catalogueToken": s.catalogue_token, "catalogueSubjectClaims": s.catalogue_subject_properties,
+            "sinceUpdateMs": ms(s.since_policy_update), "sinceLastPullMs": ms(s.since_last_pull),
+            "untilNextPullMs": ms(s.until_next_pull), "pulls": s.pulls, "pullsChanged": s.pulls_changed,
+            "pullFailures": s.pull_failures, "eventsReceived": s.events_received, "eventsIgnored": s.events_ignored,
+            "sinceLastEventMs": ms(s.since_last_event),
+        },
+        "decisions": {
+            "total": s.decisions, "allowed": s.allowed, "denied": s.refused, "unavailable": s.unavailable,
+            "undischargeable": s.undischargeable, "meanMicros": s.mean_decision_micros, "maxMicros": s.max_decision_micros,
+            "permitCacheEntries": s.permit_cache_entries, "permitCacheHits": s.permit_cache_hits,
+        },
+        "controlPlane": {
+            "uptimeMs": ms(s.uptime), "registrations": s.registrations, "heartbeats": s.heartbeats,
+            "heartbeatFailures": s.heartbeat_failures, "sinceLastHeartbeatMs": ms(s.since_last_heartbeat),
+            "untilNextHeartbeatMs": ms(s.until_next_heartbeat), "recordsQueued": s.records_queued,
+            "recordsShipped": s.records_shipped, "recordsDropped": s.records_dropped,
+        },
+    })
+}
+
+#[cfg(not(feature = "pep"))]
+pub(crate) fn pep_json(_rp: &RelyingParty) -> serde_json::Value {
+    serde_json::json!({"enabled": false, "why": "this demo was built without the pep feature"})
+}
+
+/// A duration as a person reads it: `42 s ago`, `in 5 min 0 s`.
+pub(crate) fn human(d: Option<std::time::Duration>, ago: bool) -> String {
+    let Some(d) = d else { return "—".into() };
+    let s = d.as_secs();
+    if s == 0 {
+        return if ago { "just now".into() } else { "now".into() };
+    }
+    let text = if s < 120 {
+        format!("{s} s")
+    } else if s < 7200 {
+        format!("{} min {} s", s / 60, s % 60)
+    } else {
+        format!("{} h {} min", s / 3600, s % 3600 / 60)
+    };
+    if ago { format!("{text} ago") } else { format!("in {text}") }
+}
+
+/// The Policy enforcement tab's content, drawn here and fetched again every
+/// 2 s by pep.js: four collapsible panes with stable ids, everything escaped.
+pub(crate) fn pep_fragment(rp: &RelyingParty) -> String {
+    use serde_json::{json, Value};
+    let v = pep_json(rp);
+    if v["enabled"] != json!(true) {
+        return format!(
+            "<p class=\"notice\">No embedded PEP: {}. Add a <code>pep</code> section to the configuration (<code>python3 scripts/configure_iya_sts.py --pep central</code> does it) and build with the <code>local</code> (or <code>pep</code>) feature; see <code>docs/remote-pep.md</code>.</p>",
+            esc(v["why"].as_str().unwrap_or(""))
+        );
+    }
+    let text = |x: &Value| match x {
+        Value::String(s) if s.is_empty() => "—".to_string(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => if *b { "yes".into() } else { "no".into() },
+        Value::Null => "—".into(),
+        other => other.to_string(),
+    };
+    let dur = |x: &Value, ago: bool| human(x.as_u64().map(std::time::Duration::from_millis), ago);
+    let micros = |x: &Value| x.as_u64().map(|m| if m >= 1000 { format!("{:.1} ms", m as f64 / 1000.0) } else { format!("{m} µs") }).unwrap_or_else(|| "—".into());
+    let (p, d, c) = (&v["policy"], &v["decisions"], &v["controlPlane"]);
+    let local = v["mode"] == json!("local");
+    let mut decisions = vec![
+        ("Decisions".to_string(), text(&d["total"])),
+        ("Allowed".into(), text(&d["allowed"])),
+        ("Denied".into(), text(&d["denied"])),
+        ("Unavailable (no decision; refused)".into(), text(&d["unavailable"])),
+        ("Stopped by an obligation".into(), text(&d["undischargeable"])),
+        ("Mean time per decision".into(), micros(&d["meanMicros"])),
+        ("Slowest decision".into(), micros(&d["maxMicros"])),
+    ];
+    if !local {
+        decisions.push(("Permit cache".into(), format!("{} held, {} answered from it", text(&d["permitCacheEntries"]), text(&d["permitCacheHits"]))));
+    }
+    let mut policy = vec![
+        ("Policies held".to_string(), if local { text(&p["count"]) } else { "— (central mode: iya-sts decides)".into() }),
+        ("Last policy update".into(), dur(&p["sinceUpdateMs"], true)),
+        ("Last pull (changed or not)".into(), dur(&p["sinceLastPullMs"], true)),
+        ("Next scheduled pull".into(), dur(&p["untilNextPullMs"], false)),
+        ("Pulls".into(), format!("{} ({} brought changes, {} failed)", text(&p["pulls"]), text(&p["pullsChanged"]), text(&p["pullFailures"]))),
+        ("Policy-change events".into(), format!("{} acted on, {} for another PEP; last {}", text(&p["eventsReceived"]), text(&p["eventsIgnored"]), dur(&p["sinceLastEventMs"], true))),
+        ("Catalogue claims sent".into(), text(&p["catalogueSubjectClaims"])),
+    ];
+    if local {
+        policy.push(("Policy set version".into(), text(&p["syncToken"])));
+    }
+    policy.push(("Catalogue version".into(), text(&p["catalogueToken"])));
+    let the_pep = vec![
+        ("Name".to_string(), text(&v["name"])),
+        ("Mode".into(), text(&v["mode"])),
+        ("Application".into(), text(&v["application"])),
+        ("iya-sts".into(), text(&v["pdpUrl"])),
+        ("Registered".into(), text(&v["registered"])),
+        ("Running".into(), format!("{} (up {})", text(&v["running"]), dur(&c["uptimeMs"], false).trim_start_matches("in "))),
+        ("Policy-change events on the stream".into(), text(&v["eventStream"])),
+        ("Protocol version".into(), text(&v["protocolVersion"])),
+        ("Key thumbprint".into(), text(&v["keyThumbprint"])),
+    ];
+    let control = vec![
+        ("Heartbeats".to_string(), format!("{} ({} failed)", text(&c["heartbeats"]), text(&c["heartbeatFailures"]))),
+        ("Last heartbeat".into(), dur(&c["sinceLastHeartbeatMs"], true)),
+        ("Next heartbeat".into(), dur(&c["untilNextHeartbeatMs"], false)),
+        ("Registrations".into(), text(&c["registrations"])),
+        ("Decision records".into(), format!("{} queued, {} sent, {} dropped", text(&c["recordsQueued"]), text(&c["recordsShipped"]), text(&c["recordsDropped"]))),
+    ];
+    let mut out = String::new();
+    let problems = v["problems"].as_str().unwrap_or("");
+    if !problems.is_empty() {
+        out.push_str(&format!("<p class=\"problem\">{}</p>", esc(problems)));
+    }
+    for (id, title, rows) in [("pep-decisions", "Decisions", decisions), ("pep-cached-policy", "Cached policy", policy), ("pep-the-pep", "The PEP", the_pep), ("pep-control-plane", "Control plane", control)] {
+        // The id is stable, so pep.js keeps a pane the person closed closed.
+        out.push_str(&format!("<details class=\"card pane\" id=\"{id}\" open><summary><h2>{}</h2></summary><table class=\"facts\">", esc(title)));
+        for (k, val) in rows {
+            out.push_str(&format!("<tr><th>{}</th><td>{}</td></tr>", esc(&k), esc(&val)));
+        }
+        out.push_str("</table></details>");
+    }
+    out.push_str("<p><small>Refreshed every 2 seconds. <a href=\"/pep-status\">As JSON</a>.</small></p>");
     out
 }
 

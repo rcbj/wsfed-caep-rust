@@ -59,3 +59,5 @@ mod test_plain_http;
 mod test_pep;
 #[cfg(all(test, feature = "local"))]
 mod test_authzen;
+#[cfg(test)]
+mod test_demo_pep;

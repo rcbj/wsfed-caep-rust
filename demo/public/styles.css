@@ -2,3 +2,16 @@
 /* SPDX-License-Identifier: MIT */
 body { font-family: sans-serif; margin: 2rem; }
 a.button, button { padding: 0.4rem 0.8rem; }
+main { max-width: 56rem; }
+.page-tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid #ccc; margin: 1rem 0; }
+.page-tab { padding: 0.4rem 0.9rem; text-decoration: none; border: 1px solid transparent; border-bottom: none; border-radius: 0.3rem 0.3rem 0 0; }
+.page-tab[aria-selected="true"] { border-color: #ccc; background: #fff; margin-bottom: -1px; font-weight: bold; }
+.card { border: 1px solid #ddd; border-radius: 0.4rem; padding: 0.5rem 1rem; margin: 0.75rem 0; }
+details.pane > summary { cursor: pointer; list-style: revert; }
+details.pane > summary h2 { display: inline; font-size: 1.1rem; margin: 0; }
+details.pane[open] > summary { margin-bottom: 0.5rem; }
+table.facts { border-collapse: collapse; width: 100%; }
+table.facts th { text-align: left; font-weight: normal; color: #555; padding: 0.2rem 1rem 0.2rem 0; width: 40%; vertical-align: top; }
+table.facts td { padding: 0.2rem 0; word-break: break-all; }
+.problem { color: #a40000; background: #fdecea; padding: 0.5rem 0.75rem; border-radius: 0.3rem; }
+.notice { background: #eef4fb; padding: 0.5rem 0.75rem; border-radius: 0.3rem; }
