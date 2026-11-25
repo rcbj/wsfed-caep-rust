@@ -63,3 +63,5 @@ mod test_authzen;
 mod test_demo_pep;
 #[cfg(test)]
 mod test_demo;
+#[cfg(all(test, feature = "local"))]
+mod test_demo_decisions;

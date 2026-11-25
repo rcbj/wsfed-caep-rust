@@ -256,18 +256,18 @@ fn the_table_covers_what_it_must_and_matches_its_compiled_policies() {
 // The offline run: a stub PDP and a `local` party.
 // ---------------------------------------------------------------------------
 
-struct Pdp {
-    url: String,
+pub(crate) struct Pdp {
+    pub(crate) url: String,
     rows: Value,
     directory: Value,
-    policies: Mutex<(String, Vec<Value>)>,
+    pub(crate) policies: Mutex<(String, Vec<Value>)>,
     /// The catalogue's `fgaApplications`: the bound application in the
     /// `application` phase, where it enforces fine-grained authorization.
-    fga_applications: Mutex<Vec<String>>,
-    evaluations: AtomicUsize,
+    pub(crate) fga_applications: Mutex<Vec<String>>,
+    pub(crate) evaluations: AtomicUsize,
 }
 
-fn start_pdp(table: &Value) -> &'static Pdp {
+pub(crate) fn start_pdp(table: &Value) -> &'static Pdp {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let port = server.server_addr().to_ip().unwrap().port();
     let pdp: &'static Pdp = Box::leak(Box::new(Pdp {
@@ -355,14 +355,14 @@ fn pip_answer(directory: &Value, query: &str) -> String {
     )
 }
 
-fn key_file(tag: &str) -> String {
+pub(crate) fn key_file(tag: &str) -> String {
     let path = std::env::temp_dir().join(format!("wsfed-authzen-{tag}-{}.pem", std::process::id()));
     std::fs::write(&path, stub::idp_key()).unwrap();
     path.to_string_lossy().into_owned()
 }
 
 /// Waits until `ready` holds for the party's PEP, or panics with its status.
-fn wait_for(party: &RelyingParty, what: &str, ready: impl Fn(&crate::pep::Status) -> bool) {
+pub(crate) fn wait_for(party: &RelyingParty, what: &str, ready: impl Fn(&crate::pep::Status) -> bool) {
     let pep = party.pep().expect("a PEP");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {

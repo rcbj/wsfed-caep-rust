@@ -18,7 +18,7 @@ use crate::ssf::{events, SignalEvent};
 use crate::test_ssf::login_of;
 use crate::test_support::{self as stub, AssertionOptions, MetaOptions, WResultOptions, IDP_ENTITY, REALM, REPLY};
 
-fn party(extra: Value) -> RelyingParty {
+pub(crate) fn party(extra: Value) -> RelyingParty {
     let mut config = json!({
         "realm": REALM, "replyUrl": REPLY, "signals": false,
         "privateKey": stub::rp_key(), "certificate": stub::rp_cert(),
@@ -30,7 +30,7 @@ fn party(extra: Value) -> RelyingParty {
     RelyingParty::create(config.as_object().unwrap(), Path::new(".")).unwrap()
 }
 
-fn text(body: Vec<u8>) -> String {
+pub(crate) fn text(body: Vec<u8>) -> String {
     String::from_utf8(body).unwrap()
 }
 
@@ -45,7 +45,7 @@ fn header(name: &str, value: &str) -> HashMap<String, String> {
 /// Signs in through the demo's own routes with `token` (the stub's signed
 /// assertion when `None`), and answers the session's cookie header and the
 /// wresult it posted.
-fn sign_in(app: &App, token: Option<String>) -> (HashMap<String, String>, String) {
+pub(crate) fn sign_in(app: &App, token: Option<String>) -> (HashMap<String, String>, String) {
     let (_, fields, _) = app.handle("GET", "/login", &HashMap::new(), b"");
     let location = fields.iter().find(|(k, _)| k == "location").map(|(_, v)| v.clone()).unwrap();
     let params = first_map(url::Url::parse(&location).unwrap().query().unwrap_or(""));
