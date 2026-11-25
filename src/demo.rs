@@ -16,13 +16,10 @@ use crate::names::{DS, XENC};
 use crate::relying_party::{LoginOptions, ReplyBody, ReplyRequest, RelyingParty};
 use crate::ssf::{events, ReceiverOptions, SignalEvent, SignalsReceiver, TlsConfig};
 use crate::token::Login;
-use crate::x509util::cert_pem_body;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use pem::Pem;
-use rsa::pkcs8::EncodePrivateKey;
 use serde_json::{json, Value};
 use sha2::Sha256;
 use ua_cryptography_xml_c14n::roxmltree::Node;
@@ -1180,8 +1177,8 @@ pub fn main_args() -> i32 {
             Some("not configured (signals are off)")
         } else if transmitter_of.is_empty() {
             Some("not configured (no ssf block in the configuration file)")
-        } else if app.rp.config.private_key.is_none() {
-            Some("not running: the relying party has no private key")
+        } else if app.rp.config.ssf_tls_client().is_none() {
+            Some("not running: no TLS client identity (ssf.clientCertificate and ssf.clientKey, or the relying party's key pair)")
         } else {
             None
         };
@@ -1199,10 +1196,13 @@ pub fn main_args() -> i32 {
                     *app.receiver_state.lock().unwrap() = "not running: ssf.addSubjects must be true or false".to_string();
                     println!("ssf: not started: ssf.addSubjects must be true or false");
                 }
-                if !transmitter.is_empty() && app.rp.config.private_key.is_some() && add_subjects.is_some() {
+                let identity = app.rp.config.ssf_tls_client();
+                if !transmitter.is_empty() && add_subjects.is_some() {
+                  if let Some((cert, key)) = identity {
                     let interval = ssf.get("pollIntervalMs").and_then(|item| item.as_i64().or_else(|| item.as_f64().map(|n| n as i64))).filter(|n| *n > 0).unwrap_or(5000);
-                    let cert = app.rp.config.certificate.as_ref().map(|item| format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", wrap64(&cert_pem_body(&item.der)))).unwrap_or_default();
-                    let key = app.rp.config.private_key.as_ref().and_then(|item| item.to_pkcs8_der().ok()).map(|der| pem::encode(&Pem::new("PRIVATE KEY", der.as_bytes().to_vec()))).unwrap_or_default();
+                    // The receiver's own identity at the transmitter: the
+                    // realm-issued ssf.clientCertificate/clientKey, else the
+                    // relying party's key pair (Resolved::ssf_tls_client).
                     let sessions = app.sessions_handle();
                     match SignalsReceiver::new(transmitter, Arc::new(move |ids, _| { for id in ids { sessions.lock().unwrap().remove(id); } Ok(()) }), ReceiverOptions {
                         tls: Some(TlsConfig { ca: app.rp.config.idp_ca.clone(), cert, key }),
@@ -1236,6 +1236,7 @@ pub fn main_args() -> i32 {
                             println!("ssf: not started: {err}");
                         }
                     }
+                  }
                 }
             }
         }
@@ -1247,8 +1248,5 @@ pub fn main_args() -> i32 {
     0
 }
 
-fn wrap64(body: &str) -> String {
-    body.as_bytes().chunks(64).map(|chunk| std::str::from_utf8(chunk).unwrap_or("")).collect::<Vec<_>>().join("\n")
-}
 
 pub fn write_stdout(bytes: &[u8]) { let _ = io::stdout().write_all(bytes); }

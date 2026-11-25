@@ -150,6 +150,8 @@ fn private_key(pem_text: &str) -> std::result::Result<PrivateKeyDer<'static>, St
         ("pkcs8", body.split("-----END PRIVATE KEY-----").next().unwrap_or(""))
     } else if let Some(body) = pem_text.split("-----BEGIN RSA PRIVATE KEY-----").nth(1) {
         ("pkcs1", body.split("-----END RSA PRIVATE KEY-----").next().unwrap_or(""))
+    } else if let Some(body) = pem_text.split("-----BEGIN EC PRIVATE KEY-----").nth(1) {
+        ("sec1", body.split("-----END EC PRIVATE KEY-----").next().unwrap_or(""))
     } else {
         return Err("the client key cannot be read".to_string());
     };
@@ -157,7 +159,25 @@ fn private_key(pem_text: &str) -> std::result::Result<PrivateKeyDer<'static>, St
     let der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, compact).map_err(|err| err.to_string())?;
     Ok(match tag {
         "pkcs8" => PrivateKeyDer::Pkcs8(der.into()),
+        "sec1" => PrivateKeyDer::Sec1(der.into()),
         _ => PrivateKeyDer::Pkcs1(der.into()),
     })
+}
+
+/// Why `cert` (a PEM chain, leaf first) and `key` (PKCS#8, PKCS#1 or SEC1
+/// PEM) cannot be a TLS client identity, or `None` when the TLS client
+/// takes them: the same check the first connection would make, at
+/// configuration time.
+pub(crate) fn client_identity_problem(cert: &str, key: &str) -> Option<String> {
+    let certs = match pem_ders(cert) {
+        Ok(value) => value,
+        Err(_) => return Some("the certificate holds no CERTIFICATE block".to_string()),
+    };
+    let key_der = match private_key(key) {
+        Ok(value) => value,
+        Err(err) => return Some(err),
+    };
+    let builder = ClientConfig::builder().with_root_certificates(RootCertStore::empty());
+    builder.with_client_auth_cert(certs, key_der).err().map(|err| err.to_string())
 }
 

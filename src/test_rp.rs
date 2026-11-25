@@ -435,3 +435,80 @@ fn status_success_constant() {
     assert_eq!(RSA_SHA256, "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256");
     assert_eq!(DEFAULT_SUBJECT_ATTRIBUTE, "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier");
 }
+
+// ---------------------------------------------------------------------------
+// The Shared Signals receiver's TLS client identity: its own
+// (`ssf.clientCertificate`, `ssf.clientKey`), else the relying party's.
+// ---------------------------------------------------------------------------
+
+/// An EC P-256 key and a certificate for it, made with openssl in `dir`
+/// (as iya-sts issues a TLS client certificate: `keyAlg` ec-p256).
+fn ec_identity(dir: &Path) -> (String, String) {
+    std::fs::create_dir_all(dir).unwrap();
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("openssl").args(args).current_dir(dir).output().expect("openssl");
+        assert!(out.status.success(), "openssl {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    run(&["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", "ssf-client.key"]);
+    run(&["req", "-new", "-x509", "-key", "ssf-client.key", "-subj", "/CN=wsfed demo SSF receiver", "-days", "2", "-out", "ssf-client.crt"]);
+    (std::fs::read_to_string(dir.join("ssf-client.crt")).unwrap(), std::fs::read_to_string(dir.join("ssf-client.key")).unwrap())
+}
+
+#[test]
+fn the_receiver_authenticates_with_the_relying_partys_key_pair_by_default() {
+    let config = cfg(&[("ssf", json!({"transmitter": "https://sts.test"}))], None);
+    let resolved = resolve_config(&config, Path::new(".")).unwrap();
+    let (cert, key) = resolved.ssf_tls_client().expect("the RP key pair");
+    assert_eq!(crate::x509util::load_cert(&cert).unwrap().der, crate::x509util::load_cert(stub::rp_cert()).unwrap().der);
+    let key = crate::x509util::load_private_key(&key).unwrap();
+    use rsa::traits::PublicKeyParts;
+    assert_eq!(key.n(), resolved.private_key.as_ref().unwrap().n(), "the same key, as PKCS#8");
+    let mut keyless = cfg(&[], None);
+    keyless.remove("privateKey");
+    keyless.remove("certificate");
+    assert!(resolve_config(&keyless, Path::new(".")).unwrap().ssf_tls_client().is_none(), "nothing to present");
+}
+
+#[test]
+fn the_receiver_has_its_own_identity_when_the_configuration_names_one() {
+    let dir = std::env::temp_dir().join(format!("wsfed-ssf-client-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (cert_pem, key_pem) = ec_identity(&dir);
+    // A chain, leaf first, as the install script writes the issued one.
+    let chained = format!("{cert_pem}{}", stub::idp_cert());
+    std::fs::write(dir.join("ssf-client-chain.crt"), &chained).unwrap();
+    let config = cfg(&[("ssf", json!({"transmitter": "https://sts.test", "clientCertificate": "file:ssf-client-chain.crt", "clientKey": "file:ssf-client.key"}))], None);
+    let resolved = resolve_config(&config, &dir).unwrap();
+    assert_eq!(resolved.ssf_tls_client(), Some((chained.clone(), key_pem.clone())), "relative to the configuration's directory, the chain kept whole");
+    // The WS-Federation key pair is untouched: metadata, decryption.
+    assert_eq!(resolved.certificate.as_ref().unwrap().der, crate::x509util::load_cert(stub::rp_cert()).unwrap().der);
+    // It needs no relying-party key pair at all.
+    let mut keyless = config.clone();
+    keyless.remove("privateKey");
+    keyless.remove("certificate");
+    assert_eq!(resolve_config(&keyless, &dir).unwrap().ssf_tls_client(), Some((chained, key_pem.clone())));
+    // A PEM inline works too.
+    let inline = cfg(&[("ssf", json!({"clientCertificate": cert_pem, "clientKey": key_pem}))], None);
+    assert!(resolve_config(&inline, Path::new(".")).unwrap().ssf_tls_client().is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_half_or_unusable_ssf_client_identity_is_refused() {
+    let dir = std::env::temp_dir().join(format!("wsfed-ssf-client-bad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (cert_pem, key_pem) = ec_identity(&dir);
+    for (ssf, says) in [
+        (json!({"clientCertificate": cert_pem}), "go together"),
+        (json!({"clientKey": key_pem}), "go together"),
+        (json!({"clientCertificate": 7, "clientKey": key_pem}), "ssf.clientCertificate must be a PEM or a file path"),
+        (json!({"clientCertificate": "file:nowhere.crt", "clientKey": key_pem}), "ssf.clientCertificate is neither a PEM nor a readable file"),
+        (json!({"clientCertificate": key_pem, "clientKey": key_pem}), "not a TLS client identity"),
+        (json!({"clientCertificate": cert_pem, "clientKey": "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"}), "not a TLS client identity"),
+    ] {
+        let config = cfg(&[("ssf", ssf)], None);
+        let err = resolve_config(&config, &dir).map(|_| ());
+        rejects(&err, "config", says);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
