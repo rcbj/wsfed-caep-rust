@@ -162,10 +162,12 @@ let party = wsfed_caep::from_file("wsfed.json", None)?; // registers the PEP and
 
 // After `let login = party.handle_reply(...)?` and `receiver.track(&session_id, &login, expires_at)`:
 let access = Access::new("read", "order", order_id);
-match party.decide_session(&receiver, &session_id, &login, &access) {
+let decision = party.decide_session(&receiver, &session_id, &login, &access);
+let status = decision.http_status(); // 200 for a Permit, 403 for anything else
+match decision {
     Decision::Permit { obligations, .. } => serve(obligations),
-    Decision::Deny { why } => forbidden(&why),          // 403
-    Decision::Unavailable { why } => forbidden(&why),   // 403: fail closed
+    Decision::Deny { why } => forbidden(status, &why),          // 403
+    Decision::Unavailable { why } => forbidden(status, &why),   // 403: fail closed
 }
 // Without a receiver: party.decide(&login, &access)
 ```
