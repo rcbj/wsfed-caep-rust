@@ -219,6 +219,46 @@ The receiver keeps the PEP's view of the stream current: `requested` (or `exclud
 - **Rotating the key.** Generate a new key, certify it with `issue-pep-credential` (add `revokePrevious: true` to retire the old one), replace the file, and call `pep().unwrap().reload_key()` (or wait up to 30 s). The tokens bound to the old key are dropped.
 - **Audit.** In `local` mode each decision becomes an audit row in iya-sts (`authzen.remote.decision`). In `central` mode iya-sts records its own.
 
+## Credentials
+
+The PEP's half of the README's [Credentials](../README.md#credentials) section, in more detail. The headings match the README's.
+
+### The application's own credentials
+
+The relying party's WS-Federation key pair (`privateKey`, `certificate`) and its Shared Signals client certificate (`ssf.clientCertificate`, `ssf.clientKey`, issued by the realm) belong to the application, not the PEP. The README's table lists them. The PEP uses neither, and the library makes sure it can't (below).
+
+### The embedded PEP's credentials
+
+**The service account.** The PEP signs in as a service account of its own (step 2): `pep-wsfed-demo` in the demo (`--pep-name`), with no password (`credential: none`), owned by `admin-write`, and a member of `remote-peps`. The install script creates it only when `GET /admin-api/users?user=` says it doesn't exist.
+
+**The key.** `pep.assertionKey`, an EC P-256 private key in PEM (RSA of 2048 bits or more is accepted). In the demo it is `generated/pep-key.pem`, made on the host with `openssl genpkey` and created 0600. It is never printed and never in the image. Only its certificate request (`CN=<name>`) leaves the machine, to `POST /admin-api/xacml/issue-pep-credential` with `application` = the application's identifier. That certifies the key for the account and binds the PEP to the application in one call; `set-pep-application` binds it again on its own.
+
+**What the key authenticates.** iya-pep signs an RFC 7523 self-assertion with it, through the client `sts-remote-pep` (`clientId`), at iya-sts's token endpoint (`grant_type` `urn:ietf:params:oauth:grant-type:jwt-bearer`). It receives DPoP-bound (RFC 9449) access tokens and signs every DPoP proof with the same key. There is one token per audience:
+
+| Scope | Resource | Calls |
+|---|---|---|
+| `xacml:pep` | `<pdpUrl>/xacml/pep` | registration (`/xacml/pep/register`), heartbeat (`/xacml/pep/heartbeat`), the catalogue (`/xacml/pep/authzen-catalogue`), the policy pull (`/xacml/pep/policies?scope=bound-application`, `local`), and the PIP (`POST /xacml/pip`, `local`) |
+| `xacml:pep-audit` | `<pdpUrl>/admin-api` | decision records (`POST /admin-api/pep-audit`, `local`) |
+| `authzen:evaluate` | `<pdpUrl>/access/v1` | the evaluation (`POST /access/v1/evaluation`, `central`) |
+
+Each token is used until 30 s before it expires. A changed key file drops every token. iya-pep logs and returns no token, key or proof.
+
+**Separate from the application's keys.** `RelyingParty::create` refuses a `pep.assertionKey` that is `privateKey`, and `SignalsReceiver::new` refuses one that is the receiver's TLS client key (the realm-issued `ssf.clientKey`, or `privateKey` when that is absent). Both compare JWK thumbprints. The PEP's tokens are bound to its key, so a shared key would let whoever holds the application's key obtain the PEP's tokens and act as the PEP. Replacing one would also replace the other.
+
+**Rotation.** The install script's `--pep` keeps an existing account and key and only binds them again, so it is safe to run as often as you like. To replace the key, delete `generated/pep-key.pem` and run `--pep <mode>` again (a new key is made and certified), then revoke the old certificate on **Protocols → XACML → Remote PEPs**. Done by hand, *Operate it* above has the steps (`issue-pep-credential` with `revokePrevious: true`). The PEP reads the file again when it changes (`reload_key()`, or within 30 s).
+
+### Install-time only
+
+The install script's management token comes from `sts-api-client`'s secret (`ADMIN_API_CLIENT_SECRET` or `STS_ADMIN_API_CLIENT_SECRET`, from the environment only, never stored or printed), with `admin:read admin:write`. Defining `attr1` alone uses a second token with `admin:read admin:security`. The PEP never sees either.
+
+### Trust material
+
+`pep.tlsCa` defaults to `idpCa`, the iya-sts listener CA chain the install script saves. The PEP verifies iya-sts's TLS with it on every call. A `local` PEP's policies, catalogue and PIP answers come over that verified connection with its own token. A `pep-policies-changed` event is only a hint, verified as a SET by the receiver, and the PEP pulls with its own credential.
+
+### Development and product iya-sts
+
+The PEP's credential is the same in both modes: the certified key and the `remote-peps` membership. Its TLS trust is the listener chain in `pep.tlsCa`, whatever the mode.
+
 ## Troubleshooting
 
 | What you see | Likely cause |

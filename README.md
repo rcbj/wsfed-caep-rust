@@ -130,6 +130,61 @@ A bare `--pep` is `local`. It needs an iya-sts with embedded-PEP support (iya-st
 
 **`GET /attribute-protected`** is decided on a directory attribute rather than a claim: the demo application's policy permits `read` on `attribute-protected` when the person's `attr1` is `abc123`, and the PEP asks iya-sts's PIP for it (`POST /xacml/pip`); the value is not in the assertion. The install script gives the test user `attr1=abc123`. Defining the realm's custom attribute `attr1` is a Security Administrator's act (it changes the attribute policy): it needs a token carrying `admin:security` whose subject holds `SECURITY_ADMIN`. iya-sts seeds `sts-api-client` in that role, so the script defines `attr1` itself, with an `admin:security` token minted for that one call (every other call carries `admin:read admin:write`). Where an operator has taken the client out of the role, the definition is refused; the script still tries the value (`attr1` may be defined already) and only when that fails says what to do: a Security Administrator adds it under **Directory > Policies > Attribute policy > Custom attributes** (label "Attribute 1", syntax string, one value) before the script is run again. The script rewrites the application's policy on every run while it is this script's own (PolicyId `urn:example:wsfeddemo-orders`), so a new rule reaches an existing install; a policy with another PolicyId is left as it is.
 
+## Credentials
+
+Every credential the library, the demo and its scripts use: what it is, where it lives, and how it is replaced. Paths are relative to `demo/`. No script prints a key, a password or a secret: only paths.
+
+### The application's own credentials
+
+These are the relying party's own credentials, for its WS-Federation registration and sign-in and for its Shared Signals stream.
+
+| Credential | What it is | Made or issued by | Where it lives | Used for | How iya-sts learns of it | Rotation |
+|---|---|---|---|---|---|---|
+| WS-Federation key pair | An RSA key (3072 bits by default; `--bits` 2048, 3072 or 4096) and a self-signed certificate valid for 1095 days (`--days`). The subject is `CN=wsfed-caep-rust demo RP, OU=<realm>` with a subjectAltName URI of the realm. | `wsfed-caep generate-keys`, run inside the demo image. The install script runs it when neither file exists and `wsfed-caep` is on its PATH, which is the case only inside the image. | `privateKey` → `generated/rp.key` (0600, PKCS#8) and `certificate` → `generated/rp.crt` (0644). | Decrypting encrypted assertions (`wantAssertionsEncrypted` needs it); its certificate is the encryption key (`KeyDescriptor use="encryption"`) in the relying party's metadata. WS-Federation signs nothing here, and the metadata is not signed. It is also the receiver's TLS client identity when the configuration names no `ssf.clientCertificate`. | It doesn't need to. The registration is the realm and the reply URL. The install script writes `generated/rp-metadata.xml` but doesn't upload it, and iya-sts's passive WS-Federation profile doesn't encrypt tokens. Earlier versions of the install script pinned this certificate for Shared Signals; the current one removes that (see below). | `generate-keys --force` (with `-e PORT`, or `--realm`), then run the install script again to rewrite `rp-metadata.xml`, then restart the demo. Nothing at iya-sts breaks. An identity provider that encrypts to the old certificate needs the new metadata first. |
+| Shared Signals client certificate | An EC P-256 key and a TLS client certificate (`clientAuth`, subjectAltName `urn:sts:application:<realm>`), with its chain. | iya-sts's realm tls-client Issuing CA, through `POST /admin-api/applications/issue-tls-client-certificate` (`keyAlg` `ec-p256`), called by the install script. The one-time encrypted key is decrypted with the host's `openssl`. | `ssf.clientKey` → `generated/ssf-client.key` (0600, PKCS#8) and `ssf.clientCertificate` → `generated/ssf-client.crt` (leaf, then chain). Both are named in `wsfed.json` by the install script. `.dockerignore` keeps them out of the image, and compose mounts `generated/` read-only. | Mutual TLS on every call the receiver makes to `/ssf/*`: stream discovery and creation, polls, verification, Add and Remove Subject. iya-sts takes it as the application itself, with the scopes a token for the application would get (`oauthAllowedScope` `ssf.manage` and the `SSF_MANAGE` role). | iya-sts issued it, and the application's record lists it (by serial). It stops working at the next call once the record no longer lists it or it is revoked. | Revoke it on the application's page (its TLS client certificates), or delete the two files, then run the install script again (it issues a new one) and restart the demo. A re-run keeps a certificate the application still holds. Revoked or not listed, `/ssf/*` answers 401 and the receiver stops. |
+| Fallback: the WS-Federation key pair at `/ssf/*` | The row above's key pair, presented when `ssf.clientCertificate` and `ssf.clientKey` are absent (`Resolved::ssf_tls_client()`). | (as above) | (as above) | Mutual TLS at `/ssf/*`. | Only if an administrator trusts that self-signed certificate (a client-certificate trust anchor and the same certificate stored on the application); the install script no longer sets this up. | (as above) |
+| Test user's password | The password of `wsfed-demo-user` (`--test-user`). | `WSFED_DEMO_USER_PASSWORD` when set; otherwise iya-sts generates one when the install script creates the user. | `generated/wsfed-demo-user.password` (0600), written only when iya-sts generated it. Only the path is printed. | Signing in at iya-sts's sign-in page. | It is iya-sts's directory entry. | Set `WSFED_DEMO_USER_PASSWORD` and run the install script again (it sets the password on an existing user), or change it on the console. Without the variable, an existing user's password is left as it is. |
+| Session cookie key | 32 random bytes per demo process, used for HMAC. | `App::new`. | Memory only. | Signing the `sid` and `wsfed_pending` cookies. | It doesn't. | Every restart; everyone signed in to the demo is signed out. |
+
+The live and UI scripts make their own users and passwords for each run and keep them in memory. They reach containers as `-e NAME`, with the value in the child's environment.
+
+### The embedded PEP's credentials
+
+The PEP is a separate client of iya-sts with an identity of its own; [docs/remote-pep.md](docs/remote-pep.md#credentials) has the details.
+
+| Credential | What it is | Made or issued by | Where it lives | Used for | Rotation |
+|---|---|---|---|---|---|
+| The PEP's service account | `pep-wsfed-demo` (`--pep-name`): a service account with no password (`credential: none`), owned by `admin-write`, and a member of `remote-peps`. | The install script (`--pep`), only when `GET /users?user=` says it doesn't exist. | iya-sts's directory; the `pep` section's `name`. | Being the PEP: the bound application, registration and audit name it. | Kept on every run. |
+| The PEP's key | An EC P-256 key. | Made on the host with `openssl genpkey`. Only its certificate request (`CN=<name>`) is sent, to `POST /admin-api/xacml/issue-pep-credential` with `application` = the realm, which certifies the key and binds the PEP to the application. | `pep.assertionKey` → `generated/pep-key.pem` (0600). It is never printed and never in the image. | Signing the PEP's RFC 7523 assertion for a DPoP-bound (RFC 9449) access token through the client `sts-remote-pep`, and every DPoP proof. | `--pep` keeps an existing key and only binds it again (`set-pep-application`). To replace it, delete the file and run `--pep <mode>` again (a new key, certified), then revoke the old one on the console. The PEP reads the file again when it changes. |
+
+The library refuses a PEP key that is one of the application's own keys. `RelyingParty::create` refuses `pep.assertionKey` equal to `privateKey`, and `SignalsReceiver::new` refuses it equal to the receiver's TLS client key; both compare JWK thumbprints. A key shared between them would let whoever holds the application's key obtain the PEP's tokens and act as the PEP, and replacing one would replace the other.
+
+### Install-time only
+
+| Credential | What it is | Where it lives | Used for |
+|---|---|---|---|
+| The management client's secret | The secret of iya-sts's `sts-api-client`. | `ADMIN_API_CLIENT_SECRET` (or `STS_ADMIN_API_CLIENT_SECRET`) in the environment of `scripts/configure_iya_sts.py`. It is never written to a file or printed. The live scripts pass it to their iya-sts container as `-e NAME`. | A `client_credentials` token with `admin:read admin:write` for `<base>/admin-api`, used for every management call. A second token, `admin:read admin:security`, is minted only for the one call that defines the realm's custom attribute `attr1` (iya-sts seeds `sts-api-client` in `SECURITY_ADMIN`). |
+
+Neither the demo nor the library ever sees this secret.
+
+### Trust material
+
+All of it is public; none of it is a secret.
+
+| What | Where | What it verifies |
+|---|---|---|
+| iya-sts's listener CA chain | `idpCa` → `generated/idp-ca.pem`, written by the install script on every run through `scripts/trust_chain.py` and copied into the demo image. It is trusted on first use: compare the anchor it prints with the Root CA on iya-sts's PKI page. | iya-sts's TLS certificate, for the metadata fetch, every Shared Signals call, and the PEP's calls (`pep.tlsCa` defaults to `idpCa`). |
+| The identity provider's metadata | `idpMetadata` → `generated/idp-metadata.xml`, fetched by the install script from `<base>/wsfed/metadata/<realm>`. | The XML signature on every security token, through the signing certificates it lists. |
+| The transmitter's JWKS | Fetched at run time from the transmitter's `jwks_uri`, and refreshed when a SET names a key it doesn't hold. | The signature on every Security Event Token. |
+| The relying party's metadata | `generated/rp-metadata.xml`, written by the install script. | Nothing here; it is for an identity provider that wants this relying party's encryption certificate. |
+
+### Development and product iya-sts
+
+- **Realm-issued certificates work in both modes.** A certificate iya-sts issues chains to its Service Root. The main port trusts that Root while `tls.trustIssuedClientCertificates` is on (the default), so nothing has to be pinned in its client-certificate truststore.
+- **Why not pin the RP's certificate.** That truststore is process-wide: it applies to the main port, and to LDAPS on 636, for every realm. A self-signed certificate added there is trusted everywhere and ties the Shared Signals identity to the WS-Federation key pair. That is why the install script has the realm issue a certificate and removes the anchor earlier versions added. GNAP's product default (`gnap.mtlsTrust` `pki`) refuses a self-signed client certificate outright; gnap-caep-risc-rust moved to realm-issued certificates for that reason.
+- **Development checks fewer passwords.** iya-sts's development sign-in page checks no password: the username is the identity. Product checks the test user's password. Development also accepts any Basic password at `/ssf/*` except a reserved one, but this receiver never uses Basic.
+- **The PEP's credential is the same in both modes:** its certified key and the `remote-peps` membership.
+
 ## Layout
 
 `src/` library, `wsfed-demo`, and `wsfed-caep`. `demo/` HTTP handler page and shipped `wsfed.json`. `scripts/configure_iya_sts.py` registers the demo with iya-sts; the container `PORT` wins over the shell `PORT`. `scripts/trust_chain.py` saves iya-sts's listener CA trust chain. `Dockerfile` and comment-free `docker-compose.yml` use `network_mode: host`, `ENV PORT=3000`, and a health check of `http://127.0.0.1:${PORT}/healthz`.
