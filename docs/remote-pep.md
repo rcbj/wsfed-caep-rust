@@ -226,7 +226,17 @@ The receiver then asks its stream for `urn:iya:sts:secevent:event-type:pep-polic
 
 ## The demo
 
-Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/wsfed.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, and 403 on a Deny and on `Unavailable` (any PEP failure is a 403: the page says the PEP could not decide). A GET is `read` and any other method `write`. `GET /live-status` carries the PEP's `status()` under `pep`. The signed-in page has two tabs: **Session** (`/`, as before) and **Policy enforcement** (`/?tab=pep`), the embedded PEP's `status()` in four collapsible panes: Decisions, Cached policy, The PEP, and Control plane. `demo/public/pep.js` redraws it every 2 s from `GET /pep-status.html` and keeps a pane you closed closed; `GET /pep-status` is the same as JSON. Both need a sign-in (401 otherwise) and carry nothing secret. Without a `pep` section the tab says there is no embedded PEP.
+Built with `local` (the Dockerfile does), the demo protects `GET /orders/<id>` with the PEP when `demo/wsfed.json` has a `pep` section: 401 without a sign-in, 200 on a Permit, and 403 on a Deny and on `Unavailable` (any PEP failure is a 403: the page says the PEP could not decide). A GET is `read` and any other method `write`. `GET /attribute-protected` is decided the same way on `Access::new("read", "attribute-protected", "attr1")`: the demo application's policy permits it when the person's directory attribute `attr1` is `abc123`, which the PEP asks iya-sts's PIP for (it is not in the assertion); 401, 200, or 403 with the page saying which. Signed in, the top bar links Demo home, Attribute-protected and Order 42. `GET /live-status` carries the PEP's `status()` under `pep`.
+
+Its signed-in page has a **Policy enforcement** tab (`/?tab=pep`) showing what the PEP reports, refreshed every two seconds:
+
+- **Decisions:** how many, allowed, denied, unavailable, stopped by an obligation, and the mean and slowest time per decision (plus the Permit cache in `central` mode).
+- **Cached policy:** policies held, when the cached policy last changed, the last and the next scheduled pull, pulls (changed, failed), policy-change events, the catalogue claims sent, and the policy set's and catalogue's versions.
+- **The PEP:** name, mode, application, iya-sts, registered, running and uptime, whether the stream carries policy-change events, the protocol version and the key's thumbprint.
+- **Control plane:** heartbeats (last, next, failed), registrations, and decision records queued, sent and dropped.
+- **Try it:** links to `/orders/42` and `/attribute-protected`; the counters move as you try them.
+
+Each is a collapsible pane, and a pane you closed stays closed across the refresh (`demo/public/pep.js`, from `GET /pep-status.html`). `GET /pep-status` answers the same as JSON for a dashboard of your own. Both need a sign-in (401 otherwise) and carry nothing secret. Every number comes from `pep().unwrap().status()`, which your application can read the same way. Without a `pep` section the tab says there is no embedded PEP. The receiver keeps the PEP's view of the stream current: `requested` or `excluded` when it starts and after each good poll, `down` after a failed poll and once stopped, so the PEP polls for policy while it cannot hear the event.
 
 The install script sets the demo up with its PEP in one command, after registering the relying party:
 
