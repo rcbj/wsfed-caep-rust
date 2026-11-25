@@ -2097,7 +2097,7 @@ dependencies = [
  "rsa",
  "serde_json",
  "sha1",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "signature 3.0.0",
  "tiny_http",
  "ua-cryptography-xml-c14n",
