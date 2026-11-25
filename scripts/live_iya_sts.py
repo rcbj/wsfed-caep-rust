@@ -642,7 +642,7 @@ def prepare_sts(sts_port, secret, name=None):
     return f"https://127.0.0.1:{sts_port}", name
 
 
-def generate_keys(image, work, config):
+def generate_keys(image, work, config, realm=""):
     """Write the relying-party key pair with this crate's CLI inside the demo image."""
     (work / "generated").mkdir(parents=True, exist_ok=True)
     docker(
@@ -652,6 +652,8 @@ def generate_keys(image, work, config):
         "-w", "/work",
         image,
         "wsfed-caep", "generate-keys", "--config", "/work/" + config.name,
+        # The realm as the demo will serve it: the image's own PORT (3000) would move it.
+        *(["--realm", realm] if realm else []),
     )
 
 
@@ -886,7 +888,7 @@ def provision(work, sts_origin, demo_origin, username, password, secret, image, 
     # the registrar writes the chain where idpCa names it; built again, which
     # changes only the demo/ layer.
     docker("build", "-t", image, str(context))
-    generate_keys(image, demo_dir, config)
+    generate_keys(image, demo_dir, config, json.loads(config.read_text(encoding="utf-8"))["realm"])
     configure_demo(config, sts_origin, demo_origin, username, password, secret, pep=pep)
     ca_file = demo_dir / "generated" / "idp-ca.pem"
     if not ca_file.exists():
@@ -915,10 +917,21 @@ def provision(work, sts_origin, demo_origin, username, password, secret, image, 
     out["chain_count"] = baked.stdout.count("BEGIN CERTIFICATE")
     print(f"the demo image carries the {out['chain_count']}-certificate chain at /app/demo/generated/idp-ca.pem", flush=True)
     mounts = [(demo_dir / "generated" / name, f"/app/demo/generated/{name}") for name in ("rp.key", "rp.crt", "idp-metadata.xml")]
+    # The receiver's realm-issued TLS client identity (ssf.clientCertificate/clientKey).
+    mounts += [(demo_dir / "generated" / name, f"/app/demo/generated/{name}") for name in ("ssf-client.key", "ssf-client.crt")
+               if (demo_dir / "generated" / name).exists()]
+    out["ssfClientCertificate"] = (demo_dir / "generated" / "ssf-client.crt").exists()
     if pep:
         mounts.append((pep_key, "/app/demo/" + PEP_KEY))
     out["mounts"] = mounts
     return out
+
+
+def rp_subject(demo_dir):
+    """The RP certificate's subject and SAN, as the host's openssl reads them (no secret)."""
+    done = subprocess.run(["openssl", "x509", "-in", str(demo_dir / "generated" / "rp.crt"), "-noout", "-subject", "-ext", "subjectAltName", "-nameopt", "RFC2253"],
+                          capture_output=True, text=True, check=False)
+    return " ".join(done.stdout.split()) if done.returncode == 0 else ""
 
 
 def checked_ports(sts_port, demo_port, sts_given):
@@ -984,7 +997,8 @@ def main():
             ),
             "session-revoked to end the local session",
         )
-        result = {"ok": True, "subject": signed_in.get("subject"), "idpCaInImage": chain_count, "events": finished.get("events")}
+        result = {"ok": True, "subject": signed_in.get("subject"), "idpCaInImage": chain_count, "events": finished.get("events"),
+                  "ssfClientCertificate": made["ssfClientCertificate"], "rpCertificate": rp_subject(made["demo_dir"])}
         if pep:
             # THEN local: the same image and iya-sts, the copy that says local.
             start_demo(image, demo_name, demo_port, demo_origin, mounts, env={"WSFED_CONFIG": "demo/" + PEP_LOCAL_CONFIG})

@@ -24,6 +24,17 @@ is this script's own (OWN_POLICY_IDS); a policy under another PolicyId is left a
 user is given attr1=abc123 (a custom attribute, defined with an admin:security token), which
 GET /attribute-protected is decided on.
 
+With an ssf block (and signals not false) the application is let manage its own stream
+(oauthAllowedScope ssf.manage, SSF_MANAGE) and the realm issues it a TLS client certificate
+(issue-tls-client-certificate, ec-p256, urn:sts:application:<realm>), which the receiver presents
+at /ssf/* by mutual TLS: generated/ssf-client.key (0600, decrypted with openssl from the one-time
+encrypted PEM, never printed) and generated/ssf-client.crt (leaf and chain), named in
+ssf.clientKey and ssf.clientCertificate. It is separate from the WS-Federation key pair in the RP
+metadata. A certificate the application still holds is kept on a re-run. Once it is in place, what
+earlier versions set up for the RP's self-signed certificate is removed by its SHA-256: the
+process-wide client-certificate trust anchor (tls/trust/remove) and the copy stored on the
+application (applications/remove-certificate).
+
 Every run writes iya-sts's listener CA trust chain (leaf, TLS Issuing CA, Intermediate, Root) to the
 file idpCa names, through scripts/trust_chain.py. The demo image build copies that file in, so
 rebuild the image after running this against a different iya-sts.
@@ -34,6 +45,7 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -47,6 +59,14 @@ ROOT = Path(__file__).resolve().parent.parent
 # The embedded PEP (--pep). The key's path is relative to the configuration's directory, which is
 # also how the `pep` section names it: this library resolves assertionKey like privateKey.
 PEP_MODES = ("central", "local")
+# The Shared Signals receiver's own TLS client identity: a certificate the realm issues the
+# application (issue-tls-client-certificate: the realm's tls-client Issuing CA,
+# urn:sts:application:<realm>), which authenticates it at /ssf/* by mutual TLS. It is separate
+# from the WS-Federation key pair in the RP metadata. The configuration names it in
+# ssf.clientCertificate and ssf.clientKey.
+SSF_CLIENT_KEY = "generated/ssf-client.key"
+SSF_CLIENT_CERT = "generated/ssf-client.crt"
+SSF_CLIENT_LABEL = "wsfed demo SSF receiver"
 PEP_NAME = "pep-wsfed-demo"
 PEP_KEY = "generated/pep-key.pem"
 PEP_KEY_IN_SECTION = "file:generated/pep-key.pem"
@@ -285,6 +305,15 @@ def files_of(config_path: str) -> dict:
         "rp_metadata": str((Path(key).parent / "rp-metadata.xml").resolve()),
         "ssf_transmitter": (raw.get("ssf") or {}).get("transmitter"),
     }
+    # Where the realm-issued Shared Signals client identity goes: the configuration's own
+    # ssf.clientKey/clientCertificate paths, else generated/ssf-client.*. An inline PEM or env:
+    # value is the operator's own and is left alone (None).
+    ssf = raw.get("ssf") if isinstance(raw.get("ssf"), dict) else {}
+    for name, member, default in (("ssf_client_key", "clientKey", SSF_CLIENT_KEY), ("ssf_client_cert", "clientCertificate", SSF_CLIENT_CERT)):
+        try:
+            files[name] = at(ssf.get(member) or default, "ssf." + member)
+        except ValueError:
+            files[name] = None
     if _signals_off(raw["signals"] if "signals" in raw else None):
         files["signals"] = False
     return files
@@ -303,16 +332,33 @@ def idp_metadata_url(base: str, realm: str) -> str:
     return f"{base}/wsfed/metadata/{urllib.parse.quote(realm, safe='')}"
 
 
-def ssf_calls(files: dict, base: str, certificate_pem: str) -> list[dict]:
+def ssf_grants(files: dict, base: str) -> list[dict]:
+    """What lets the application manage its own stream: the scope it declares and the role that
+    authorizes it (what a token for it would be issued; a certificate holds the same)."""
     return [
         {"method": "POST", "path": f"{base}/admin-api/applications/add", "why": "declare the Shared Signals write scope",
          "body": {"application": files["realm"], "attribute": "oauthAllowedScope", "value": "ssf.manage"}},
         {"method": "POST", "path": f"{base}/admin-api/roles/add-member", "why": "hold SSF_MANAGE, which authorizes it",
          "body": {"role": "SSF_MANAGE", "kind": "application", "member": files["realm"]}},
-        {"method": "POST", "path": f"{base}/admin-api/tls/trust/add", "why": "trust the RP certificate at the TLS handshake",
-         "body": {"certificates": certificate_pem}},
-        {"method": "POST", "path": f"{base}/admin-api/applications/add-certificate", "why": "store the RP certificate on the application",
-         "body": {"application": files["realm"], "certificate": certificate_pem}},
+    ]
+
+
+def ssf_calls(files: dict, base: str) -> list[dict]:
+    """Every Shared Signals call, as --dry-run lists them: the grants, the realm-issued TLS client
+    certificate, and the retirement of what earlier versions of this script set up for the RP's
+    self-signed certificate (a client-certificate trust anchor and a stored certificate)."""
+    return ssf_grants(files, base) + [
+        {"method": "GET", "path": f"{base}/admin-api/applications?application={urllib.parse.quote(files['realm'], safe='')}",
+         "why": "is the certificate in ssf.clientCertificate one this application holds? then it is kept", "body": None},
+        {"method": "POST", "path": f"{base}/admin-api/applications/issue-tls-client-certificate",
+         "why": f"otherwise have the realm issue the receiver its TLS client certificate into {files['ssf_client_key']} (0600) and {files['ssf_client_cert']}",
+         "body": {"application": files["realm"], "password": "<one-time, generated>", "keyAlg": "ec-p256", "label": SSF_CLIENT_LABEL}},
+        {"method": "POST", "path": f"{base}/admin-api/tls/trust/remove",
+         "why": "then stop trusting the RP's self-signed certificate at the handshake (added by earlier versions)",
+         "body": {"fingerprint": "<SHA-256 of the RP certificate>"}},
+        {"method": "POST", "path": f"{base}/admin-api/applications/remove-certificate",
+         "why": "and take it off the application's entry (stored by earlier versions)",
+         "body": {"application": files["realm"], "sha256": "<SHA-256 of the RP certificate>"}},
     ]
 
 
@@ -327,7 +373,7 @@ def plan_for(files: dict, base: str, test_user: str) -> list[dict]:
         {"method": "GET", "path": idp_metadata_url(base, files["realm"]), "body": None, "why": f"fetch the IdP metadata into {files['idp_metadata']}"},
     ]
     if files.get("signals") is not False and files.get("ssf_transmitter"):
-        calls[3:3] = ssf_calls(files, base, "<the RP certificate>")
+        calls[3:3] = ssf_calls(files, base)
     if test_user:
         calls.append({"method": "POST", "path": f"{base}/admin-api/users/create", "why": f"create the test user {test_user}", "body": {"username": test_user}})
         calls.append({"method": "POST", "path": f"{base}/admin-api/policies/define-person-attribute",
@@ -522,6 +568,132 @@ def _ok(answer: dict, what: str, allow: str = "") -> bool:
     raise RuntimeError(f"{what}: refused ({answer['status']}): {json.dumps(body)[:400]}")
 
 
+def pem_sha256(pem: str) -> str:
+    """The SHA-256 of a PEM's first certificate, lowercase hex: how iya-sts names a trust anchor
+    and a stored certificate."""
+    import base64
+    import hashlib
+    body = pem.split("-----BEGIN CERTIFICATE-----", 1)[1].split("-----END CERTIFICATE-----", 1)[0]
+    return hashlib.sha256(base64.b64decode("".join(body.split()))).hexdigest()
+
+
+def _openssl_x509(cert_path: str, *fields: str) -> dict:
+    out = subprocess.run(["openssl", "x509", "-in", cert_path, "-noout", *fields, "-nameopt", "RFC2253"],
+                         capture_output=True, text=True, check=False)
+    if out.returncode != 0:
+        return {}
+    return {key.strip().lower(): value.strip() for key, _, value in (line.partition("=") for line in out.stdout.splitlines()) if _}
+
+
+def held_serials(get, application: str) -> list[str] | None:
+    """The serials of the TLS client certificates the realm issued this application and has not
+    revoked (page.mtls.certificates), uppercase hex without leading zeros; None when this iya-sts
+    does not say."""
+    page = (get(f"/applications?application={urllib.parse.quote(application, safe='')}") or {}).get("page") or {}
+    mtls = page.get("mtls")
+    if not isinstance(mtls, dict) or not isinstance(mtls.get("certificates"), list):
+        return None
+    return [str(one.get("serialHex") or "").upper().lstrip("0") for one in mtls["certificates"]
+            if isinstance(one, dict) and str(one.get("state") or "").lower() not in ("revoked", "expired")]
+
+
+def write_ssf_client_section(config_path: str) -> None:
+    """ssf.clientCertificate and ssf.clientKey, unless the configuration names its own already;
+    every other member is kept."""
+    path = Path(config_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    section = raw.get("ssf") if isinstance(raw.get("ssf"), dict) else {}
+    section.setdefault("clientCertificate", "file:" + SSF_CLIENT_CERT)
+    section.setdefault("clientKey", "file:" + SSF_CLIENT_KEY)
+    raw["ssf"] = section
+    path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+
+def issue_ssf_client_certificate(api, get, files: dict, config_path: str) -> bool:
+    """The Shared Signals receiver's TLS client certificate, issued by the realm to the
+    application (`issue-tls-client-certificate`: the realm's tls-client Issuing CA,
+    urn:sts:application:<realm>, clientAuth). iya-sts's /ssf/* takes such a certificate as the
+    application itself (ssf/ssf_auth.ts, attemptClientCertificate) while the application's record
+    lists it, with the scopes a token for it would get (oauthAllowedScope and SSF_MANAGE). The key
+    goes to ssf.clientKey (0600, decrypted with openssl from the one-time encrypted PEM, never
+    printed), the certificate and its chain to ssf.clientCertificate, and the configuration names
+    both. A certificate this application still holds is kept. Answers whether one was issued."""
+    import secrets
+    key_path, cert_path = files["ssf_client_key"], files["ssf_client_cert"]
+    if not key_path or not cert_path:
+        print("ssf.clientCertificate and ssf.clientKey are given inline or from the environment; they are yours and left as they are.")
+        return False
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        fields = _openssl_x509(cert_path, "-subject", "-issuer", "-serial")
+        held = held_serials(get, files["realm"])
+        serial = fields.get("serial", "").upper().lstrip("0")
+        issued_here = bool(fields) and fields.get("subject") != fields.get("issuer")
+        if issued_here and (serial in held if held is not None else True):
+            print(f"The Shared Signals client certificate in {cert_path} is one {files['realm']} holds (serial {fields.get('serial')}); kept.")
+            write_ssf_client_section(config_path)
+            return False
+    password = secrets.token_urlsafe(24)
+    answered = api("/applications/issue-tls-client-certificate", {
+        "application": files["realm"], "password": password, "keyAlg": "ec-p256", "label": SSF_CLIENT_LABEL,
+    })
+    body = answered["body"]
+    if not body.get("ok"):
+        shown = {key: value for key, value in body.items() if key != "files"}
+        raise RuntimeError(f"issuing {files['realm']} a TLS client certificate for Shared Signals was refused: {json.dumps(shown)[:400]}")
+    encrypted = ((body.get("files") or {}).get("key") or {}).get("text") or ""
+    issued = body.get("certificate") or {}
+    leaf = issued.get("certificatePem") or ""
+    chain = issued.get("chainPem") or []
+    if not encrypted or not leaf:
+        raise RuntimeError("the issued certificate's answer carried no key or certificate")
+    Path(key_path).parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.close(descriptor)
+    env = dict(os.environ, WSFED_SSF_CLIENT_KEY_PASSWORD=password)
+    done = subprocess.run(["openssl", "pkey", "-passin", "env:WSFED_SSF_CLIENT_KEY_PASSWORD", "-out", key_path],
+                          input=encrypted, capture_output=True, text=True, env=env, check=False)
+    if done.returncode != 0:
+        raise RuntimeError(f"the issued key could not be opened: {done.stderr.strip()[:200]}")
+    os.chmod(key_path, 0o600)
+    pems = [leaf] + [pem for pem in (chain if isinstance(chain, list) else [chain]) if pem and pem.strip() != leaf.strip()]
+    Path(cert_path).write_text("".join(pem if pem.endswith("\n") else pem + "\n" for pem in pems), encoding="utf-8")
+    write_ssf_client_section(config_path)
+    print(f"Issued {files['realm']} a TLS client certificate from the realm's CA for Shared Signals (serial {issued.get('serialHex', '?')},")
+    print(f"  {issued.get('implicitName') or 'urn:sts:application:' + files['realm']}); wrote {key_path} (0600) and {cert_path},")
+    print("  and named them in ssf.clientKey and ssf.clientCertificate.")
+    return True
+
+
+def retire_pinned_certificate(api, files: dict) -> list[str]:
+    """What earlier versions of this script set up so the RP's self-signed certificate could
+    authenticate at /ssf/*: a process-wide client-certificate trust anchor and the same
+    certificate stored on the application's entry. Removed by the certificate's SHA-256, once
+    the realm-issued certificate is in place; neither being there is no error. Answers what was
+    removed."""
+    if not os.path.exists(files["cert"]):
+        return []
+    fingerprint = pem_sha256(Path(files["cert"]).read_text(encoding="utf-8"))
+    colon = ":".join(fingerprint[i:i + 2] for i in range(0, 64, 2)).upper()
+    removed = []
+    for path, body, what, absent in (
+        ("/tls/trust/remove", {"fingerprint": colon}, "the client-certificate trust anchor", ("holds no anchor", "STS-TLS-0016")),
+        ("/applications/remove-certificate", {"application": files["realm"], "sha256": fingerprint}, "the certificate stored on the application", ("stores no certificate", "STS-ADMIN-0900")),
+    ):
+        try:
+            reply = api(path, body)
+        except RuntimeError as err:
+            print(f"Could not remove {what} for the RP certificate (SHA-256 {colon}): {err}")
+            continue
+        words = " ".join(_errors_of(reply["body"])) + " " + str(reply["body"].get("code") or "")
+        if reply["body"].get("ok"):
+            removed.append(what)
+        elif not any(marker.lower() in words.lower() for marker in absent):
+            print(f"Removing {what} for the RP certificate (SHA-256 {colon}) was refused: {words.strip()[:300]}")
+    if removed:
+        print(f"Retired {' and '.join(removed)} for the RP's self-signed certificate (SHA-256 {colon}): the receiver uses the realm-issued one.")
+    return removed
+
+
 def write_pep_section(config_path: str, name: str, mode: str) -> None:
     """The configuration's `pep` section: the name, the mode and the key; other members of the
     section and of the file are kept."""
@@ -601,7 +773,7 @@ def setup_pep(api, get, files: dict, config_path: str, name: str, mode: str) -> 
     print(f"Wrote a {mode} pep section into {config_path}.")
 
 
-def _generate_keys(config_path: str) -> None:
+def _generate_keys(config_path: str, realm: str = "") -> None:
     """Run this crate's `wsfed-caep generate-keys`. It is on PATH in the demo image.
 
     This script never builds anything: Cargo does not run on the host. On the host, generate the
@@ -618,7 +790,7 @@ def _generate_keys(config_path: str) -> None:
             "No key pair yet, and wsfed-caep is not on PATH. Generate one inside the demo image:\n"
             '  docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/demo:/app/demo" wsfed-caep-rust-demo wsfed-caep generate-keys --config demo/wsfed.json'
         )
-    completed = subprocess.run([binary, "generate-keys", "--config", config_path], check=False)
+    completed = subprocess.run([binary, "generate-keys", "--config", config_path, *(["--realm", realm] if realm else [])], check=False)
     if completed.returncode != 0:
         raise SystemExit(f"wsfed-caep generate-keys exited {completed.returncode}")
 
@@ -651,7 +823,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     if not Path(files["key"]).exists() and not Path(files["cert"]).exists():
         print("No key pair yet; generating one.")
-        _generate_keys(args["config"])
+        _generate_keys(args["config"], files["realm"])
     ca = None
     if files["idp_ca"]:
         try:
@@ -702,9 +874,11 @@ def main(argv: list[str] | None = None) -> None:
     if not multiple["body"].get("ok"):
         raise RuntimeError(f"setting authn.multipleAccounts was refused: {json.dumps(multiple['body'])[:300]}")
     print("authn.multipleAccounts is on: one browser may hold several signed-in people.")
+    def get(path: str) -> dict:
+        return _json(f"{base}/admin-api{path}", ca, headers={"accept": "application/json", "authorization": f"Bearer {token}"})["body"]
+
     if files.get("signals") is not False and files.get("ssf_transmitter"):
-        certificate = Path(files["cert"]).read_text(encoding="utf-8")
-        for call in ssf_calls(files, base, certificate):
+        for call in ssf_grants(files, base):
             path = call["path"][len(f"{base}/admin-api"):]
             reply = api(path, call["body"])
             errors = " ".join(_errors_of(reply["body"]))
@@ -712,7 +886,9 @@ def main(argv: list[str] | None = None) -> None:
                 raise RuntimeError(f"{call['why']}: refused: {json.dumps(reply['body'])[:400]}")
             if not reply["body"].get("ok"):
                 print(f"  {call['why']}: already so ({errors[:160]})")
-        print(f"Shared Signals: {files['realm']} holds SSF_MANAGE and authenticates to /ssf/* with its own certificate (mutual TLS).")
+        issue_ssf_client_certificate(api, get, files, args["config"])
+        retire_pinned_certificate(api, files)
+        print(f"Shared Signals: {files['realm']} holds SSF_MANAGE and authenticates to /ssf/* with the TLS client certificate its realm issued it (mutual TLS).")
     url = idp_metadata_url(base, files["realm"])
     fetched = _request(url, headers={"accept": "application/samlmetadata+xml"}, ca=ca)
     if fetched["status"] != 200:
@@ -724,8 +900,6 @@ def main(argv: list[str] | None = None) -> None:
         _ensure_user(base, ca, token, args["test_user"], api, Path(args["config"]).resolve().parent / "generated")
         set_test_attribute(api, args["test_user"])
     if args["pep"]:
-        def get(path: str) -> dict:
-            return _json(f"{base}/admin-api{path}", ca, headers={"accept": "application/json", "authorization": f"Bearer {token}"})["body"]
         setup_pep(api, get, files, args["config"], args["pep_name"], args["pep"])
         print(f"pep:  {args['pep_name']}, {args['pep']} (GET /orders/<id> needs a sign-in with an acr; any other method is denied;")
         print(f"      GET /{ATTRIBUTE_PROTECTED} needs {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE} in the directory)")
