@@ -50,6 +50,8 @@ attr1=not-abc123. In each mode GET /attribute-protected must be 200 for the
 first user and 403 (a Deny) for the denied one, who still reads /orders/42.
 
 --authzen (or LIVE_AUTHZEN=1) runs scripts/live_authzen.py instead.
+--ui (or LIVE_UI=1) runs scripts/live_ui.py instead: the same provisioning with
+--pep local, then a real headless browser through the demo's pages.
 
 IYA_STS_URL, when set, uses an iya-sts that is already running and does not
 stop it. This script never removes iya-sts-live-main, iya-sts-live-probe, or a
@@ -929,6 +931,9 @@ def main():
     if "--authzen" in sys.argv[1:] or os.environ.get("LIVE_AUTHZEN", "") in ("1", "true", "yes"):
         import live_authzen
         return live_authzen.main()
+    if "--ui" in sys.argv[1:] or os.environ.get("LIVE_UI", "") in ("1", "true", "yes"):
+        import live_ui
+        return live_ui.main()
     pep = "--pep" in sys.argv[1:] or os.environ.get("LIVE_PEP", "") in ("1", "true", "yes")
     sts_port = int(os.environ.get("LIVE_STS_PORT") or 18517)
     demo_port = int(os.environ.get("LIVE_DEMO_PORT") or 18617)
