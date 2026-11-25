@@ -136,7 +136,7 @@ Add a `pep` section to `wsfed.json`. The PEP is off unless it is present.
 | Member | Default here | What it is |
 |---|---|---|
 | `name` | required | The PEP's service account (step 2). |
-| `mode` | `central` | `central` or `local`. |
+| `mode` | `local` | `local` (the PEP pulls its application's policies, caches them in memory and decides in process) or `central` (it asks iya-sts for every decision). |
 | `assertionKey` | required | The PEP's private key in PEM: a path (a `file:` prefix is allowed); a relative one is read from the configuration file's directory, like `privateKey`. The file is re-read when it changes. |
 | `pdpUrl` | the identity provider's metadata entityID. iya-sts publishes its realm's issuer there, which is the service's base with the `/realm/<id>` prefix | iya-sts, with `/realm/<id>` for a realm. |
 | `application` | `realm` (the wtrealm) | The application the PEP is bound to (step 3). |

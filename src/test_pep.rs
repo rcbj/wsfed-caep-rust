@@ -131,7 +131,9 @@ mod with_pep {
     }
 
     fn pep_section(pdp: &Pdp, tag: &str, extra: Value) -> Value {
-        let mut section = json!({"name": "pep-demo", "assertionKey": pep_key(tag), "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000});
+        // central by name: these tests ask the stub PDP for each decision, and
+        // a section that names no mode is local (iya-pep's default).
+        let mut section = json!({"name": "pep-demo", "mode": "central", "assertionKey": pep_key(tag), "pdpUrl": pdp.url, "heartbeatIntervalMs": 60000});
         for (k, v) in extra.as_object().unwrap() {
             section[k] = v.clone();
         }
@@ -536,5 +538,17 @@ mod with_pep {
         assert!(matches!(rp.decide(&login(), &Access::new("write", "order", "42")), Decision::Deny { .. }));
         assert_eq!(pdp.count("/access/v1/evaluation"), 0, "decided in process");
         assert!(pdp.count("/xacml/pep/policies") > 0);
+    }
+
+    /// A `pep` section that names no mode is `local`: the PEP pulls the
+    /// application's policies and decides in process.
+    #[cfg(feature = "local")]
+    #[test]
+    fn a_section_without_a_mode_is_local() {
+        let pdp = start_pdp();
+        let mut section = pep_section(pdp, "default-mode", json!({}));
+        section.as_object_mut().unwrap().remove("mode");
+        let rp = create(json!({"signals": false, "pep": section})).unwrap();
+        assert_eq!(rp.pep().unwrap().status().mode, crate::pep::Mode::Local);
     }
 }

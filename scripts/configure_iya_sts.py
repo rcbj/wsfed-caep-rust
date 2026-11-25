@@ -13,7 +13,7 @@ A loopback realm and reply URL follow the port the demo listens on. The containe
 the shell PORT. An explicit --public-url or PUBLIC_URL replaces the origin and keeps the path.
 ``signals: false`` skips Shared Signals registration even when an ssf block is present.
 
---pep central|local also sets the demo up with its embedded PEP, as docs/remote-pep.md's steps 2 to
+--pep [central|local] (local when left out) also sets the demo up with its embedded PEP, as docs/remote-pep.md's steps 2 to
 6 describe: the PEP's service account in remote-peps, a P-256 key made here with openssl
 (generated/pep-key.pem beside the configuration, 0600, never printed, kept out of the image by
 .dockerignore), issue-pep-credential binding it to the demo's application, the catalogue row the
@@ -85,7 +85,7 @@ from trust_chain import save_trust_chain  # noqa: E402
 def usage() -> str:
     return """Usage: python scripts/configure_iya_sts.py [--config path] [--idp url] [--public-url url]
                                         [--test-user name | --no-test-user]
-                                        [--pep central|local] [--pep-name name] [--dry-run]
+                                        [--pep [central|local]] [--pep-name name] [--dry-run]
 
   --config        The demo's WS-Federation configuration (default: demo/wsfed.json)
   --idp           iya-sts's base URL; the realm's, e.g. https://host/realm/acme, for a trust realm
@@ -99,7 +99,8 @@ def usage() -> str:
                   generated/<user>.password beside the configuration (mode 0600); only the
                   path is printed.
   --no-test-user  Do not create a test user.
-  --pep           Also set up the demo's embedded PEP in this mode (central or local): its service
+  --pep [MODE]    Also set up the demo's embedded PEP in this mode, local (the default: it caches
+                  the application's policies and decides in process) or central: its service
                   account, its key (generated/pep-key.pem beside the configuration, 0600, made
                   with openssl), its binding to the demo's application, the catalogue row and
                   the application's own policy (enforced), and a `pep` section written into the
@@ -200,7 +201,12 @@ def parse_args(argv: list[str], env: dict | None = None) -> dict:
         elif arg == "--dry-run":
             out["dry_run"] = True
         elif arg == "--pep":
-            out["pep"] = value().strip()
+            # The mode may be left out: then local, iya-pep's default (the
+            # PEP caches the application's policies and decides in process).
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                out["pep"] = value().strip()
+            else:
+                out["pep"] = "local"
             if out["pep"] not in PEP_MODES:
                 raise SystemExit(f"--pep must be central or local, not {out['pep']}")
         elif arg == "--pep-name":
