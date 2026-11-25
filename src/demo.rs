@@ -231,8 +231,9 @@ impl App {
     /// A route the embedded PEP protects (the `pep` feature, iya-sts#1206):
     /// the signed-in person's access to one order, decided by the `pep`
     /// section's PEP. A GET is `read` and anything else `write`. No sign-in
-    /// is 401, a Deny 403, and a decision that couldn't be made 503: never
-    /// served. With a running receiver the session must still be tracked,
+    /// is 401, a Deny 403, and any other PEP failure 403 too (a decision
+    /// that couldn't be made): an enforcement point that cannot say yes says
+    /// no, and the page says which. Never served. With a running receiver the session must still be tracked,
     /// so one ended by a Shared Signals event is a Deny.
     #[cfg(feature = "pep")]
     fn order(&self, sid: &str, method: &str, id: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
@@ -258,7 +259,7 @@ impl App {
                 html(200, "Order", format!("<h1>Order {}</h1><p>The PEP permitted <code>{action}</code>.</p>{note}", esc(id)))
             }
             Decision::Deny { why } => html(403, "Forbidden", format!("<h1>Not allowed</h1><p>The PEP denied <code>{action}</code> on order {}: {}</p>", esc(id), esc(&why))),
-            Decision::Unavailable { why } => html(503, "Unavailable", format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(&why))),
+            Decision::Unavailable { why } => html(403, "Forbidden", format!("<h1>No decision</h1><p>The PEP could not decide: {}</p>", esc(&why))),
         }
     }
 }

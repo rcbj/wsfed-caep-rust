@@ -58,7 +58,7 @@ wsfed-caep = { version = "…", features = ["local"] }  # local too: decided in 
 match party.decide_session(&receiver, &session_id, &login, &Access::new("read", "order", "42")) {
     Decision::Permit { obligations, .. } => { /* discharge them, then serve */ }
     Decision::Deny { .. } => { /* 403 */ }
-    Decision::Unavailable { .. } => { /* 503: fail closed, never a Permit */ }
+    Decision::Unavailable { .. } => { /* 403: fail closed, never a Permit */ }
 }
 ```
 

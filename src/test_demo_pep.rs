@@ -4,7 +4,7 @@
 //! The demo's Policy enforcement tab (#40): the tab bar beside Session, the
 //! four collapsible panes drawn from the PEP's `Status` with stable ids, the
 //! escaping, the no-PEP notice, the durations, and `/pep-status(.html)`
-//! refused without a sign-in.
+//! refused without a sign-in, and any PEP failure on `/orders/<id>` a 403.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -125,4 +125,17 @@ fn the_tab_draws_every_pane_counts_and_escapes() {
     assert_eq!((v["enabled"].clone(), v["mode"].clone(), v["decisions"]["unavailable"].clone()), (json!(true), json!("central"), json!(1)));
     rp.pep().unwrap().stop();
     let _ = std::fs::remove_file(&key);
+}
+
+#[cfg(feature = "pep")]
+#[test]
+fn a_pep_failure_on_the_protected_route_is_a_403() {
+    // Without a pep section the PEP cannot decide (Unavailable): that is a
+    // refusal like a Deny, 403, and the page says it was no decision.
+    let (app, cookie) = signed_in(party(json!({})));
+    let (status, _, body) = app.handle("GET", "/orders/42", &cookie, b"");
+    let page = text(body);
+    assert_eq!(status, 403, "{page}");
+    assert!(page.contains("<title>Forbidden</title>"), "{page}");
+    assert!(page.contains("<h1>No decision</h1><p>The PEP could not decide: no pep section is configured</p>"), "{page}");
 }
