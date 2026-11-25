@@ -57,6 +57,10 @@ struct State {
     /// Every PATCH body, and whether PATCH is refused (405).
     patches: Vec<Value>,
     refuse_patch: bool,
+    /// When not 0, every poll is answered with this status (a transmitter down).
+    poll_status: u16,
+    /// Every verification request body.
+    verifications: Vec<Value>,
 }
 
 pub(crate) struct Stub {
@@ -93,6 +97,13 @@ impl Stub {
     /// Answer every PATCH 405 from now on.
     pub(crate) fn refuse_patch(&self) { self.state.lock().unwrap().refuse_patch = true; }
 
+    /// Every verification request the stub was sent.
+    pub(crate) fn verifications(&self) -> Vec<Value> { self.state.lock().unwrap().verifications.clone() }
+
+    #[cfg(feature = "pep")]
+    /// Answer every poll with `status` from now on (0: answer them again).
+    pub(crate) fn fail_polls(&self, status: u16) { self.state.lock().unwrap().poll_status = status; }
+
     pub(crate) fn new() -> Self {
         let key = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
         let other = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
@@ -108,6 +119,8 @@ impl Stub {
             jwk: jwk_of(&key, "k1"),
             patches: Vec::new(),
             refuse_patch: false,
+            poll_status: 0,
+            verifications: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let state_for = state.clone();
@@ -215,6 +228,15 @@ fn answer(state: &Mutex<State>, url: &str, method: &str, path: &str, body: &[u8]
         });
         state.streams.push(stream.clone());
         return (201, stream);
+    }
+    if path == "/ssf/verify" && method == "POST" {
+        let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        let known = state.streams.iter().any(|item| item["stream_id"] == parsed["stream_id"]);
+        state.verifications.push(parsed);
+        return if known { (200, json!({})) } else { (404, json!({"err": "no such stream"})) };
+    }
+    if path.starts_with("/ssf/poll/") && state.poll_status != 0 {
+        return (state.poll_status, json!({"err": "down"}));
     }
     if path.starts_with("/ssf/poll/") {
         let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
@@ -342,6 +364,29 @@ fn subjects() {
     assert!(subject_of(&json!({"format": "iss_sub", "iss": "https://other", "sub": "urn:uuid:a"}), "https://i").is_empty());
     let email = subject_of(&json!({"format": "email", "email": "A@x.com"}), "https://i");
     assert_eq!(email.get("email").map(String::as_str), Some("A@x.com"));
+}
+
+/// A verification request names the receiver's stream and carries the
+/// state; before `start` there is no stream to name, and a refusal is an
+/// error.
+#[test]
+fn verify_asks_for_a_verification_event_on_the_stream() {
+    let stub = Stub::new();
+    let log = Arc::new(MemLog { errors: Mutex::new(Vec::new()) });
+    let receiver = SignalsReceiver::new(&stub.url, Arc::new(|_, _| Ok(())), opts(log, None, 60_000)).unwrap();
+    let _stop = Stop(receiver.clone());
+    let early = receiver.verify("s-0").unwrap_err();
+    assert!(early.message.contains("no stream yet") || early.message.contains("verification_endpoint"), "{}", early.message);
+    receiver.start().unwrap();
+    receiver.verify("demo-1").unwrap();
+    receiver.verify("").unwrap();
+    let asked = stub.verifications();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!(asked[0], json!({"stream_id": "s1", "state": "demo-1"}));
+    assert_eq!(asked[1], json!({"stream_id": "s1"}), "no state member when none is given");
+    stub.state.lock().unwrap().streams.clear();
+    let refused = receiver.verify("x").unwrap_err();
+    assert!(refused.message.contains("answered 404"), "{}", refused.message);
 }
 
 #[test]

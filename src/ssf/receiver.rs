@@ -119,6 +119,11 @@ pub struct SignalsReceiver {
     /// whether the stream does.
     #[cfg(feature = "pep")]
     pep: Option<Arc<crate::pep::Pep>>,
+    /// What the stream carries for the PEP (`requested` or `excluded`), once
+    /// `start` knows: a failed poll reports `down`, and the next good one
+    /// this again.
+    #[cfg(feature = "pep")]
+    pep_stream: Mutex<Option<crate::pep::EventStream>>,
     state: Mutex<State>,
     running: AtomicBool,
     inflight: Mutex<Option<Arc<Flight>>>,
@@ -180,6 +185,8 @@ impl SignalsReceiver {
             log: opts.log.unwrap_or_else(|| Arc::new(StdLog)),
             #[cfg(feature = "pep")]
             pep: event_pep,
+            #[cfg(feature = "pep")]
+            pep_stream: Mutex::new(None),
             state: Mutex::new(State { config: Map::new(), stream: Map::new(), keys: Vec::new(), keys_at: None, ack: Vec::new(), errs: Map::new(), handlers }),
             running: AtomicBool::new(false),
             inflight: Mutex::new(None),
@@ -225,7 +232,9 @@ impl SignalsReceiver {
         if let Some(pep) = &self.pep {
             let carries = |name: &str| stream.get(name).and_then(Value::as_array).map(|list| list.iter().any(|v| v.as_str() == Some(crate::pep::POLICIES_CHANGED_EVENT)));
             let carried = carries("events_delivered").or_else(|| carries("events_requested")).unwrap_or(true);
-            pep.set_event_stream(if carried { crate::pep::EventStream::Requested } else { crate::pep::EventStream::Excluded });
+            let state = if carried { crate::pep::EventStream::Requested } else { crate::pep::EventStream::Excluded };
+            pep.set_event_stream(state);
+            *self.pep_stream.lock().unwrap() = Some(state);
         }
         let endpoint = delivery_url(&stream);
         if endpoint.is_empty() { return Err(fail("ssf", "the stream has no poll endpoint_url")); }
@@ -253,6 +262,9 @@ impl SignalsReceiver {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        // A stopped receiver hears nothing: the PEP polls from now on.
+        #[cfg(feature = "pep")]
+        self.report_pep_stream(Some(crate::pep::EventStream::Down));
         if let Some(tx) = self.stop_tx.lock().unwrap().take() { let _ = tx.send(()); }
         let done = self.done_rx.lock().unwrap().take();
         if let Some(done) = done {
@@ -297,6 +309,11 @@ impl SignalsReceiver {
             flight
         };
         let result = self.poll_now();
+        // The PEP's view of the stream follows the polls: down while they
+        // fail (it polls its own policies instead), and what the stream
+        // carries again once one succeeds.
+        #[cfg(feature = "pep")]
+        self.report_pep_stream(if result.is_ok() { *self.pep_stream.lock().unwrap() } else { Some(crate::pep::EventStream::Down) });
         *flight.result.lock().unwrap() = Some(result.clone());
         {
             let mut slot = self.inflight.lock().unwrap();
@@ -305,6 +322,33 @@ impl SignalsReceiver {
         *flight.done.lock().unwrap() = true;
         flight.cv.notify_all();
         result
+    }
+
+    /// Asks the transmitter for a verification event on this stream (SSF
+    /// 1.0 section 8.1.4): it arrives on the stream like any other event,
+    /// carrying `state` back when one was given. Needs a started receiver.
+    pub fn verify(&self, state: &str) -> Result<()> {
+        let (endpoint, stream_id) = {
+            let shared = self.state.lock().unwrap();
+            (text_of(&shared.config, "verification_endpoint"), text_of(&shared.stream, "stream_id"))
+        };
+        if endpoint.is_empty() { return Err(fail("ssf", "the transmitter publishes no verification_endpoint")); }
+        if stream_id.is_empty() { return Err(fail("ssf", "the receiver has no stream yet: start it first")); }
+        let mut body = json!({"stream_id": stream_id});
+        if !state.is_empty() { body["state"] = Value::String(state.to_string()); }
+        let (status, _) = self.call("POST", &endpoint, Some(&body))?;
+        if status != 200 && status != 204 { return Err(fail("ssf", format!("verification answered {status}"))); }
+        Ok(())
+    }
+
+    /// Tells the PEP whose events this stream carries what the stream is
+    /// doing, so its heartbeat's `policyEvents` is true and it polls its own
+    /// policies when it cannot hear.
+    #[cfg(feature = "pep")]
+    fn report_pep_stream(&self, state: Option<crate::pep::EventStream>) {
+        if let (Some(pep), Some(state)) = (&self.pep, state) {
+            pep.set_event_stream(state);
+        }
     }
 
     fn poll_now(&self) -> Result<bool> {

@@ -474,7 +474,6 @@ mod with_pep {
         let receiver = receiver_for(&tx, &rp);
         let _stop = Stop(receiver.clone());
         receiver.start().unwrap();
-        receiver.stop();
         assert_eq!(tx.created(), 0, "the stream was reused, not made again");
         let patches = tx.patches();
         assert_eq!(patches.len(), 1, "{patches:?}");
@@ -487,6 +486,7 @@ mod with_pep {
         assert_eq!(stream["delivery"]["endpoint_url"], format!("{}/ssf/poll/old", tx.url), "the delivery the listing gave is kept");
         assert!(errors.0.lock().unwrap().is_empty(), "{:?}", errors.0.lock().unwrap());
         assert_policy_events(pdp, "requested");
+        receiver.stop();
 
         // Nothing missing: no PATCH.
         let again = receiver_for(&tx, &rp);
@@ -503,10 +503,41 @@ mod with_pep {
         let refused = receiver_for(&tx, &rp);
         let _stop_refused = Stop(refused.clone());
         refused.start().unwrap();
-        refused.stop();
         assert_eq!(tx.patches().len(), 1);
         assert!(errors.0.lock().unwrap().iter().any(|l| l.contains("answered 405")), "{:?}", errors.0.lock().unwrap());
+        let pep = rp.pep().cloned().unwrap();
+        assert_eq!(pep.status().event_stream, crate::pep::EventStream::Excluded, "running, and the stream does not carry the event");
         assert_policy_events(pdp, "excluded");
+        refused.stop();
+        assert_eq!(pep.status().event_stream, crate::pep::EventStream::Down, "a stopped receiver hears nothing");
+    }
+
+    /// The PEP's view of the stream follows the receiver's polls: a failed
+    /// poll is `down` (the PEP then polls its own policies), the next good
+    /// one is what the stream carries again, and `stop` is `down`.
+    #[test]
+    fn the_peps_stream_state_follows_the_polls() {
+        let pdp = start_pdp();
+        let rp = create(json!({"pep": pep_section(pdp, "polls", json!({"permitCacheMs": 30000, "signals": true}))})).unwrap();
+        let tx = Stub::new();
+        let receiver = SignalsReceiver::new(&tx.url, Arc::new(|_, _| Ok(())), ReceiverOptions {
+            poll_interval_ms: 60_000,
+            pep: rp.pep().cloned(),
+            ..ReceiverOptions::default()
+        }).unwrap();
+        let _stop = Stop(receiver.clone());
+        let pep = rp.pep().cloned().unwrap();
+        assert_eq!(pep.status().event_stream, crate::pep::EventStream::Down, "signals on, and nothing reported before the receiver starts");
+        receiver.start().unwrap();
+        assert_eq!(pep.status().event_stream, crate::pep::EventStream::Requested);
+        tx.fail_polls(503);
+        assert!(receiver.poll_once().is_err());
+        assert_eq!(pep.status().event_stream, crate::pep::EventStream::Down, "a failed poll: down");
+        tx.fail_polls(0);
+        receiver.poll_once().unwrap();
+        assert_eq!(pep.status().event_stream, crate::pep::EventStream::Requested, "a good poll: what the stream carries");
+        receiver.stop();
+        assert_eq!(pep.status().event_stream, crate::pep::EventStream::Down);
     }
 
     #[test]
