@@ -61,6 +61,12 @@ struct State {
     poll_status: u16,
     /// Every verification request body.
     verifications: Vec<Value>,
+    /// Whether the configuration publishes add/remove subject endpoints.
+    subject_endpoints: bool,
+    /// When not 0, every Add/Remove Subject is answered with this status.
+    subject_status: u16,
+    /// Every Add/Remove Subject call: "add" or "remove", and its body.
+    subject_calls: Vec<(String, Value)>,
 }
 
 pub(crate) struct Stub {
@@ -97,6 +103,15 @@ impl Stub {
     /// Answer every PATCH 405 from now on.
     pub(crate) fn refuse_patch(&self) { self.state.lock().unwrap().refuse_patch = true; }
 
+    /// Publish add_subject_endpoint and remove_subject_endpoint.
+    pub(crate) fn subject_endpoints(&self) { self.state.lock().unwrap().subject_endpoints = true; }
+
+    /// Answer every Add/Remove Subject with `status` (0: 200 and 204 again).
+    pub(crate) fn subject_status(&self, status: u16) { self.state.lock().unwrap().subject_status = status; }
+
+    /// Every Add/Remove Subject call received, in order.
+    pub(crate) fn subject_calls(&self) -> Vec<(String, Value)> { self.state.lock().unwrap().subject_calls.clone() }
+
     /// Every verification request the stub was sent.
     pub(crate) fn verifications(&self) -> Vec<Value> { self.state.lock().unwrap().verifications.clone() }
 
@@ -121,6 +136,9 @@ impl Stub {
             refuse_patch: false,
             poll_status: 0,
             verifications: Vec::new(),
+            subject_endpoints: false,
+            subject_status: 0,
+            subject_calls: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let state_for = state.clone();
@@ -170,7 +188,7 @@ fn serve(listener: TcpListener, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>,
         let Some((method, path, body)) = read_http(&mut stream) else { continue };
         let path = path.split('?').next().unwrap_or("");
         let (status, payload) = answer(&state, &url, &method, path, &body);
-        let raw = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+        let raw = if status == 204 { Vec::new() } else { serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec()) };
         let head = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", raw.len());
         let _ = stream.write_all(head.as_bytes());
         let _ = stream.write_all(&raw);
@@ -180,13 +198,29 @@ fn serve(listener: TcpListener, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>,
 fn answer(state: &Mutex<State>, url: &str, method: &str, path: &str, body: &[u8]) -> (u16, Value) {
     let mut state = state.lock().unwrap();
     if path == "/.well-known/ssf-configuration" {
-        return (200, json!({
+        let mut config = json!({
             "issuer": url,
             "jwks_uri": format!("{url}/jwks"),
             "configuration_endpoint": format!("{url}/ssf/stream"),
             "verification_endpoint": format!("{url}/ssf/verify"),
             "delivery_methods_supported": ["urn:ietf:rfc:8936"],
-        }));
+        });
+        if state.subject_endpoints {
+            config["add_subject_endpoint"] = json!(format!("{url}/ssf/subjects:add"));
+            config["remove_subject_endpoint"] = json!(format!("{url}/ssf/subjects:remove"));
+        }
+        return (200, config);
+    }
+    if (path == "/ssf/subjects:add" || path == "/ssf/subjects:remove") && method == "POST" {
+        let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        let kind = if path.ends_with("add") { "add" } else { "remove" };
+        state.subject_calls.push((kind.to_string(), parsed.clone()));
+        if state.subject_status != 0 {
+            return (state.subject_status, json!({"err": "access_denied", "description": "no active session for this subject"}));
+        }
+        let known = state.streams.iter().any(|item| item["stream_id"] == parsed["stream_id"]);
+        // SSF 1.0: Add Subject answers 200, Remove Subject 204.
+        return match (known, kind) { (false, _) => (404, json!({"err": "no such stream"})), (true, "add") => (200, json!({})), _ => (204, Value::Null) };
     }
     if path == "/jwks" {
         return (200, json!({"keys": [state.jwk]}));
@@ -299,7 +333,7 @@ fn read_http(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
 struct MemLog { errors: Mutex<Vec<String>> }
 impl SignalsLog for MemLog {
     fn info(&self, _: &str) {}
-    fn warn(&self, _: &str) {}
+    fn warn(&self, message: &str) { self.errors.lock().unwrap().push(format!("warn: {message}")); }
     fn error(&self, message: &str) { self.errors.lock().unwrap().push(message.to_string()); }
 }
 
@@ -543,4 +577,134 @@ fn refuses_a_transmitter_without_poll_delivery() {
     let receiver = SignalsReceiver::new("http://127.0.0.1:1", Arc::new(|_, _| Ok(())), opts(Arc::new(MemLog { errors: Mutex::new(Vec::new()) }), None, 0)).unwrap();
     let err: Result<()> = receiver.start();
     rejects(&err, "ssf", "");
+}
+
+// ---------------------------------------------------------------------------
+// Add Subject and Remove Subject (SSF 1.0 sections 8.1.3.2 and 8.1.3.3).
+// ---------------------------------------------------------------------------
+
+fn quiet() -> Arc<MemLog> { Arc::new(MemLog { errors: Mutex::new(Vec::new()) }) }
+
+/// A running receiver on `stub` (a long poll interval: the tests poll).
+fn running(stub: &Stub, log: Arc<MemLog>, add_subjects: bool) -> Arc<SignalsReceiver> {
+    let options = ReceiverOptions { add_subjects, ..opts(log, None, 60_000) };
+    let receiver = SignalsReceiver::new(&stub.url, Arc::new(|_, _| Ok(())), options).unwrap();
+    receiver.start().unwrap();
+    receiver
+}
+
+fn iss_sub(stub: &Stub, person: &str) -> Value {
+    json!({"format": "iss_sub", "iss": stub.url, "sub": format!("urn:uuid:{person}")})
+}
+
+#[test]
+fn a_sign_in_adds_its_subject_and_the_last_sign_out_removes_it() {
+    let stub = Stub::new();
+    stub.subject_endpoints();
+    let receiver = running(&stub, quiet(), true);
+    let _stop = Stop(receiver.clone());
+    receiver.track("L-a1", &login_of("alice", "IDP-A1"), None);
+    assert_eq!(stub.subject_calls(), vec![("add".to_string(), json!({"stream_id": "s1", "subject": iss_sub(&stub, "alice"), "verified": true}))],
+        "iss_sub, as the receiver matches events; verified: the person came from a verified token");
+    receiver.track("L-a2", &login_of("alice", "IDP-A2"), None);
+    assert_eq!(stub.subject_calls().len(), 2, "each new local session asks again (idempotent at the transmitter)");
+    receiver.untrack("L-a1");
+    assert_eq!(stub.subject_calls().len(), 2, "no remove while another session for alice lives");
+    receiver.untrack("L-a2");
+    let calls = stub.subject_calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2], ("remove".to_string(), json!({"stream_id": "s1", "subject": iss_sub(&stub, "alice")})), "Remove Subject carries no verified member");
+    receiver.untrack("L-a2");
+    assert_eq!(stub.subject_calls().len(), 3, "untracking twice removes once");
+    // No subject attribute: the email events about the person carry.
+    let mut mailed = login_of("dana", "IDP-D1");
+    mailed.attributes.remove(DEFAULT_SUBJECT_ATTRIBUTE);
+    receiver.track("L-d1", &mailed, None);
+    assert_eq!(stub.subject_calls()[3].1["subject"], json!({"format": "email", "email": "dana@example.com"}));
+    receiver.untrack("L-d1");
+    assert_eq!(stub.subject_calls()[4].1["subject"], json!({"format": "email", "email": "dana@example.com"}));
+    assert_eq!(receiver.subjects_health(), crate::ssf::SubjectsHealth { added: 3, removed: 2, ..Default::default() });
+}
+
+#[test]
+fn a_session_ended_by_an_event_removes_the_subject_when_it_was_the_last() {
+    let stub = Stub::new();
+    stub.subject_endpoints();
+    let receiver = running(&stub, quiet(), true);
+    let _stop = Stop(receiver.clone());
+    receiver.track("L-a1", &login_of("alice", "IDP-A1"), None);
+    receiver.track("L-a2", &login_of("alice", "IDP-A2"), None);
+    receiver.track("L-b1", &login_of("bob", "IDP-B1"), None);
+    let session = |person: &str, id: &str| json!({"format": "complex", "user": iss_sub(&stub, person), "session": {"format": "opaque", "id": id}});
+    stub.put(events::event("session_revoked"), session("alice", "IDP-A1"), None, None, "", "");
+    receiver.poll_once().unwrap();
+    let removes = |calls: Vec<(String, Value)>| calls.into_iter().filter(|(kind, _)| kind == "remove").map(|(_, body)| body["subject"].clone()).collect::<Vec<_>>();
+    assert!(removes(stub.subject_calls()).is_empty(), "alice still has L-a2");
+    assert!(!receiver.is_tracked("L-a1") && receiver.is_tracked("L-a2"));
+    stub.put(events::event("session_revoked"), session("bob", "IDP-B1"), None, None, "", "");
+    receiver.poll_once().unwrap();
+    assert_eq!(removes(stub.subject_calls()), vec![iss_sub(&stub, "bob")], "bob's only session ended");
+    stub.put(events::event("account_disabled"), iss_sub(&stub, "alice"), None, None, "", "");
+    receiver.poll_once().unwrap();
+    assert_eq!(removes(stub.subject_calls()), vec![iss_sub(&stub, "bob"), iss_sub(&stub, "alice")]);
+    receiver.untrack("L-a2");
+    assert_eq!(removes(stub.subject_calls()).len(), 2, "already gone: nothing more to remove");
+}
+
+#[test]
+fn a_refused_or_failed_subject_call_is_reported_and_never_fails_the_sign_in() {
+    let stub = Stub::new();
+    stub.subject_endpoints();
+    let log = quiet();
+    let receiver = running(&stub, log.clone(), true);
+    let _stop = Stop(receiver.clone());
+    // iya-sts#2234: 403 when the person has no active session there (a race).
+    stub.subject_status(403);
+    receiver.track("L-e1", &login_of("erin", "IDP-E1"), None);
+    assert!(receiver.is_tracked("L-e1"), "the sign-in stands");
+    assert_eq!(stub.subject_calls().len(), 1, "one call, no retry");
+    let health = receiver.subjects_health();
+    assert_eq!((health.added, health.refused, health.failed), (0, 1, 0));
+    assert!(health.last_error.contains("adding a subject (iss_sub) on stream s1 answered 403"), "{}", health.last_error);
+    assert!(log.errors.lock().unwrap().iter().any(|line| line.starts_with("warn: ") && line.contains("403")), "a 403 is a warning");
+    stub.subject_status(500);
+    receiver.untrack("L-e1");
+    assert!(!receiver.is_tracked("L-e1"));
+    let health = receiver.subjects_health();
+    assert_eq!((health.removed, health.failed), (0, 1));
+    assert!(log.errors.lock().unwrap().iter().any(|line| !line.starts_with("warn: ") && line.contains("removing a subject (iss_sub) on stream s1 answered 500")), "{:?}", log.errors.lock().unwrap());
+    // A transmitter that does not answer at all: still non-fatal.
+    drop(stub);
+    receiver.track("L-e2", &login_of("erin", "IDP-E2"), None);
+    assert!(receiver.is_tracked("L-e2"));
+    assert_eq!(receiver.subjects_health().failed, 2);
+}
+
+#[test]
+fn subject_calls_are_skipped_without_endpoints_when_not_running_or_switched_off() {
+    // The transmitter publishes no add/remove subject endpoint.
+    let bare = Stub::new();
+    let receiver = running(&bare, quiet(), true);
+    receiver.track("L-f1", &login_of("frank", "IDP-F1"), None);
+    receiver.untrack("L-f1");
+    receiver.stop();
+    assert!(bare.subject_calls().is_empty());
+
+    let stub = Stub::new();
+    stub.subject_endpoints();
+    // Switched off (the demo's ssf.addSubjects: false).
+    let off = running(&stub, quiet(), false);
+    off.track("L-f2", &login_of("frank", "IDP-F2"), None);
+    off.untrack("L-f2");
+    off.stop();
+    // Never started (as with signals off: no stream), and stopped.
+    let idle = SignalsReceiver::new(&stub.url, Arc::new(|_, _| Ok(())), opts(quiet(), None, 60_000)).unwrap();
+    idle.track("L-f3", &login_of("frank", "IDP-F3"), None);
+    idle.untrack("L-f3");
+    let stopped = running(&stub, quiet(), true);
+    stopped.stop();
+    stopped.track("L-f4", &login_of("frank", "IDP-F4"), None);
+    stopped.untrack("L-f4");
+    assert!(stub.subject_calls().is_empty(), "{:?}", stub.subject_calls());
+    assert!(ReceiverOptions::default().add_subjects, "on by default");
 }

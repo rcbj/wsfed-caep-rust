@@ -3,7 +3,7 @@
 
 use super::events::{self, subject_of};
 use super::jws::verify_compact_jws;
-use super::session::{tracked_from, MemorySessionIndex};
+use super::session::{tracked_from, MemorySessionIndex, Session};
 use crate::error::{fail, Result, WsFedError};
 use crate::httpclient::{self, TlsMaterial};
 use crate::token::Login;
@@ -62,6 +62,13 @@ pub struct ReceiverOptions {
     pub poll_interval_ms: i64,
     pub max_events: i64,
     pub log: Option<Arc<dyn SignalsLog>>,
+    /// Tell the transmitter which subjects this receiver cares about (SSF 1.0
+    /// sections 8.1.3.2 and 8.1.3.3): Add Subject when `track` starts a local
+    /// session, Remove Subject when the last local session for that person
+    /// ends. Default true; skipped when the transmitter publishes no
+    /// `add_subject_endpoint` / `remove_subject_endpoint` or the receiver is
+    /// not running. The demo reads it from `ssf.addSubjects`.
+    pub add_subjects: bool,
     /// The relying party's embedded PEP (`RelyingParty::pep`). In `local`
     /// mode, or `central` with a Permit cache, the receiver asks its stream
     /// for `pep-policies-changed` and hands each verified one to it.
@@ -81,10 +88,25 @@ impl Default for ReceiverOptions {
             poll_interval_ms: 0,
             max_events: 0,
             log: None,
+            add_subjects: true,
             #[cfg(feature = "pep")]
             pep: None,
         }
     }
+}
+
+/// What the Add Subject and Remove Subject calls have done since the
+/// receiver was made (`SignalsReceiver::subjects_health`). A call is never
+/// retried: `refused` counts 4xx answers (a 403 is expected when the person's
+/// session at the transmitter is already gone), `failed` transport errors and
+/// 5xx. SSF 1.0 section 9.1: a 200 or 204 does not promise events.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubjectsHealth {
+    pub added: u64,
+    pub removed: u64,
+    pub refused: u64,
+    pub failed: u64,
+    pub last_error: String,
 }
 
 struct Flight {
@@ -115,6 +137,8 @@ pub struct SignalsReceiver {
     poll_interval_ms: i64,
     max_events: i64,
     log: Arc<dyn SignalsLog>,
+    add_subjects: bool,
+    subjects: Mutex<SubjectsHealth>,
     /// The PEP whose policy events this stream carries, told by `start`
     /// whether the stream does.
     #[cfg(feature = "pep")]
@@ -183,6 +207,8 @@ impl SignalsReceiver {
             poll_interval_ms: if opts.poll_interval_ms == 0 { 5000 } else { opts.poll_interval_ms },
             max_events: if opts.max_events == 0 { 50 } else { opts.max_events },
             log: opts.log.unwrap_or_else(|| Arc::new(StdLog)),
+            add_subjects: opts.add_subjects,
+            subjects: Mutex::new(SubjectsHealth::default()),
             #[cfg(feature = "pep")]
             pep: event_pep,
             #[cfg(feature = "pep")]
@@ -211,11 +237,97 @@ impl SignalsReceiver {
         self.state.lock().unwrap().stream.clone()
     }
 
+    /// Tracks a local session, and (with `add_subjects`, a running receiver
+    /// and a transmitter that publishes `add_subject_endpoint`) asks the
+    /// transmitter to send this stream events about its person. The call is
+    /// made inline, on the sign-in's own thread, bounded by the HTTP client's
+    /// timeout; its outcome is logged and counted, never returned: a
+    /// sign-in does not fail because the transmitter refused a subject.
     pub fn track(&self, local_id: &str, login: &Login, expires_at: Option<DateTime<Utc>>) {
-        self.index.add(tracked_from(local_id, Some(login), &self.subject_attribute, expires_at));
+        let session = tracked_from(local_id, Some(login), &self.subject_attribute, expires_at);
+        self.index.add(session.clone());
+        self.subject_call(true, &session);
     }
 
-    pub fn untrack(&self, local_id: &str) { self.index.remove(local_id); }
+    /// Stops tracking a local session; when it was the person's last one,
+    /// asks the transmitter to stop sending events about them (Remove
+    /// Subject, as `track` adds them).
+    pub fn untrack(&self, local_id: &str) { self.forget(local_id); }
+
+    /// What Add Subject and Remove Subject have done.
+    pub fn subjects_health(&self) -> SubjectsHealth { self.subjects.lock().unwrap().clone() }
+
+    fn forget(&self, local_id: &str) {
+        let Some(session) = self.index.take(local_id) else { return };
+        let others = if !session.person.is_empty() {
+            self.index.by_person(&session.person)
+        } else if !session.email.is_empty() {
+            self.index.by_email(&session.email)
+        } else {
+            Vec::new()
+        };
+        if others.is_empty() {
+            self.subject_call(false, &session);
+        }
+    }
+
+    /// The subject identifier events about this session's person carry, as
+    /// `sessions_for` matches them: `iss_sub` (the transmitter as issuer and
+    /// the subject attribute) when the person is known, else `email`.
+    fn subject_of_session(&self, session: &Session, issuer: &str) -> Option<Value> {
+        if !session.person.is_empty() && !issuer.is_empty() {
+            return Some(json!({"format": "iss_sub", "iss": issuer, "sub": session.person}));
+        }
+        if !session.email.is_empty() {
+            return Some(json!({"format": "email", "email": session.email}));
+        }
+        None
+    }
+
+    /// Add Subject (`add`) or Remove Subject. Skipped when switched off, not
+    /// running, without a stream, without the endpoint, or without an
+    /// identifier for the person. Never retried, never an error to the caller.
+    fn subject_call(&self, add: bool, session: &Session) {
+        if !self.add_subjects || !self.running.load(Ordering::SeqCst) { return; }
+        let (endpoint, stream_id, issuer) = {
+            let state = self.state.lock().unwrap();
+            let name = if add { "add_subject_endpoint" } else { "remove_subject_endpoint" };
+            (text_of(&state.config, name), text_of(&state.stream, "stream_id"), text_of(&state.config, "issuer"))
+        };
+        if endpoint.is_empty() || stream_id.is_empty() { return; }
+        let Some(subject) = self.subject_of_session(session, &issuer) else { return };
+        let mut body = json!({"stream_id": stream_id, "subject": subject});
+        // The person comes from a token this library verified, issued by the
+        // identity provider that is this transmitter (section 8.1.3.2).
+        if add { body["verified"] = Value::Bool(true); }
+        let what = if add { "adding" } else { "removing" };
+        let format = body["subject"]["format"].as_str().unwrap_or("").to_string();
+        let outcome = self.call("POST", &endpoint, Some(&body));
+        let mut health = self.subjects.lock().unwrap();
+        match outcome {
+            Ok((200..=299, _)) => {
+                if add { health.added += 1 } else { health.removed += 1 }
+            }
+            Ok((status, parsed)) => {
+                let mut text = parsed.to_string();
+                if text.len() > 300 { text.truncate(300); }
+                let line = format!("ssf: {what} a subject ({format}) on stream {stream_id} answered {status}: {text}");
+                if (400..500).contains(&status) { health.refused += 1 } else { health.failed += 1 }
+                health.last_error = line.clone();
+                drop(health);
+                // A 403 is expected in a race: the person's session at the
+                // transmitter ended before this call (iya-sts#2234).
+                if status == 403 { self.log.warn(&line) } else { self.log.error(&line) }
+            }
+            Err(err) => {
+                let line = format!("ssf: {what} a subject ({format}) on stream {stream_id} failed: {err}");
+                health.failed += 1;
+                health.last_error = line.clone();
+                drop(health);
+                self.log.error(&line);
+            }
+        }
+    }
 
     pub fn on(self: &Arc<Self>, event_type: &str, handler: HandlerFn) {
         self.state.lock().unwrap().handlers.entry(event_type.to_string()).or_default().push(handler);
@@ -458,7 +570,7 @@ impl SignalsReceiver {
                     event.ended = false;
                 }
                 if ended {
-                    for local_id in &sessions { self.index.remove(local_id); }
+                    for local_id in &sessions { self.forget(local_id); }
                 }
             }
             let handlers = {

@@ -61,6 +61,11 @@ impl MemorySessionIndex {
         self.inner.lock().unwrap().sessions.remove(local_id);
     }
 
+    /// Removes `local_id` and answers what was tracked under it.
+    pub fn take(&self, local_id: &str) -> Option<Session> {
+        self.inner.lock().unwrap().sessions.remove(local_id)
+    }
+
     fn find(&self, mut matches: impl FnMut(&Session) -> bool) -> Vec<String> {
         let mut inner = self.inner.lock().unwrap();
         let now = Utc::now();

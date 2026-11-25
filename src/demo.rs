@@ -1189,7 +1189,17 @@ pub fn main_args() -> i32 {
         if !signals_off {
             if let Some(ssf) = ssf_block {
                 let transmitter = ssf.get("transmitter").and_then(|item| item.as_str()).unwrap_or("");
-                if !transmitter.is_empty() && app.rp.config.private_key.is_some() {
+                // ssf.addSubjects (default true): Add Subject at sign-in,
+                // Remove Subject when a person's last session here ends.
+                let add_subjects = match ssf.get("addSubjects") {
+                    None | Some(Value::Null) => Some(true),
+                    Some(value) => value.as_bool(),
+                };
+                if add_subjects.is_none() {
+                    *app.receiver_state.lock().unwrap() = "not running: ssf.addSubjects must be true or false".to_string();
+                    println!("ssf: not started: ssf.addSubjects must be true or false");
+                }
+                if !transmitter.is_empty() && app.rp.config.private_key.is_some() && add_subjects.is_some() {
                     let interval = ssf.get("pollIntervalMs").and_then(|item| item.as_i64().or_else(|| item.as_f64().map(|n| n as i64))).filter(|n| *n > 0).unwrap_or(5000);
                     let cert = app.rp.config.certificate.as_ref().map(|item| format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", wrap64(&cert_pem_body(&item.der)))).unwrap_or_default();
                     let key = app.rp.config.private_key.as_ref().and_then(|item| item.to_pkcs8_der().ok()).map(|der| pem::encode(&Pem::new("PRIVATE KEY", der.as_bytes().to_vec()))).unwrap_or_default();
@@ -1197,6 +1207,7 @@ pub fn main_args() -> i32 {
                     match SignalsReceiver::new(transmitter, Arc::new(move |ids, _| { for id in ids { sessions.lock().unwrap().remove(id); } Ok(()) }), ReceiverOptions {
                         tls: Some(TlsConfig { ca: app.rp.config.idp_ca.clone(), cert, key }),
                         poll_interval_ms: interval,
+                        add_subjects: add_subjects.unwrap_or(true),
                         #[cfg(feature = "pep")]
                         pep: app.rp.pep().cloned(),
                         ..ReceiverOptions::default()
