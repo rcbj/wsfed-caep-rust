@@ -62,7 +62,7 @@ fn durations_read_as_a_person_reads_them() {
 }
 
 #[test]
-fn the_status_needs_a_sign_in_and_the_page_has_two_tabs() {
+fn the_status_needs_a_sign_in_and_the_page_has_three_tabs() {
     let (app, cookie) = signed_in(party(json!({})));
     for path in ["/pep-status", "/pep-status.html"] {
         let (status, _, _) = app.handle("GET", path, &HashMap::new(), b"");
@@ -77,12 +77,13 @@ fn the_status_needs_a_sign_in_and_the_page_has_two_tabs() {
     assert_eq!(status, 200);
     assert!(page.contains("href=\"/\" aria-selected=\"true\" aria-current=\"page\">Session</a>"), "{page}");
     assert!(page.contains("href=\"/?tab=pep\" aria-selected=\"false\">Policy enforcement</a>"));
-    assert!(page.contains("Signed in as <strong>alice&lt;b&gt;</strong>"), "the Session tab is unchanged, and escaped");
+    assert!(page.contains("href=\"/?tab=events\" aria-selected=\"false\">CAEP &amp; RISC events"));
+    assert!(page.contains("<h1>Signed in as alice&lt;b&gt;</h1>"), "the NameID names them when no claim does, escaped: {page}");
     let csp = fields.iter().find(|(k, _)| k == "content-security-policy").map(|(_, v)| v.clone()).unwrap_or_default();
     assert!(csp.contains("connect-src 'self'") && csp.contains("script-src 'self'"), "pep.js may fetch: {csp}");
     let (_, _, tab) = app.handle("GET", "/?tab=pep", &cookie, b"");
     let tab = text(tab);
-    assert!(tab.contains("<div id=\"pep-panel\">") && tab.contains("<script src=\"/pep.js\" defer></script>"));
+    assert!(tab.contains("<div id=\"pep-panel\" aria-live=\"polite\">") && tab.contains("<script src=\"/pep.js\" defer></script>"));
     assert!(tab.contains("No embedded PEP"), "no pep section, and the tab says so");
     let (status, fields, js) = app.handle("GET", "/pep.js", &HashMap::new(), b"");
     assert_eq!(status, 200);
@@ -136,6 +137,6 @@ fn a_pep_failure_on_the_protected_route_is_a_403() {
     let (status, _, body) = app.handle("GET", "/orders/42", &cookie, b"");
     let page = text(body);
     assert_eq!(status, 403, "{page}");
-    assert!(page.contains("<title>Forbidden</title>"), "{page}");
+    assert!(page.contains("<title>Forbidden</title>") && page.contains("acct-menu"), "{page}");
     assert!(page.contains("<h1>No decision</h1><p>The PEP could not decide: no pep section is configured</p>"), "{page}");
 }

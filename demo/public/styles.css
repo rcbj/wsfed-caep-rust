@@ -1,17 +1,102 @@
-/* SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC */
-/* SPDX-License-Identifier: MIT */
-body { font-family: sans-serif; margin: 2rem; }
-a.button, button { padding: 0.4rem 0.8rem; }
-main { max-width: 56rem; }
-.page-tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid #ccc; margin: 1rem 0; }
-.page-tab { padding: 0.4rem 0.9rem; text-decoration: none; border: 1px solid transparent; border-bottom: none; border-radius: 0.3rem 0.3rem 0 0; }
-.page-tab[aria-selected="true"] { border-color: #ccc; background: #fff; margin-bottom: -1px; font-weight: bold; }
-.card { border: 1px solid #ddd; border-radius: 0.4rem; padding: 0.5rem 1rem; margin: 0.75rem 0; }
-details.pane > summary { cursor: pointer; list-style: revert; }
-details.pane > summary h2 { display: inline; font-size: 1.1rem; margin: 0; }
-details.pane[open] > summary { margin-bottom: 0.5rem; }
-table.facts { border-collapse: collapse; width: 100%; }
-table.facts th { text-align: left; font-weight: normal; color: #555; padding: 0.2rem 1rem 0.2rem 0; width: 40%; vertical-align: top; }
-table.facts td { padding: 0.2rem 0; word-break: break-all; }
-.problem { color: #a40000; background: #fdecea; padding: 0.5rem 0.75rem; border-radius: 0.3rem; }
-.notice { background: #eef4fb; padding: 0.5rem 0.75rem; border-radius: 0.3rem; }
+/* SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
+   SPDX-License-Identifier: MIT */
+:root {
+  --bg: #f7f7f5;
+  --fg: #1d2125;
+  --muted: #5d656d;
+  --line: #d9dcdf;
+  --accent: #2a5db0;
+  --problem: #9b1c1c;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #16191c; --fg: #e6e8ea; --muted: #a2a9b0; --line: #343a40; --accent: #7aa7f0; --problem: #f19a9a; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+header, main, footer { max-width: 52rem; margin: 0 auto; padding: 1rem; }
+header { border-bottom: 1px solid var(--line); }
+header a { color: var(--fg); font-weight: 600; text-decoration: none; }
+footer { color: var(--muted); font-size: 0.875rem; border-top: 1px solid var(--line); margin-top: 2rem; }
+a { color: var(--accent); }
+h1 { font-size: 1.6rem; }
+.buttons { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.button, button { display: inline-block; padding: 0.55rem 0.9rem; border: 1px solid var(--accent); border-radius: 6px;
+  color: var(--accent); background: transparent; font: inherit; text-decoration: none; cursor: pointer; }
+.button.primary, button { background: var(--accent); color: var(--bg); }
+.problem { color: var(--problem); border-left: 3px solid var(--problem); padding-left: 0.75rem; overflow-wrap: anywhere; }
+table.facts { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1.5rem; }
+table.facts th, table.facts td { text-align: left; vertical-align: top; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+table.facts th { width: 13rem; font-weight: 600; }
+small { color: var(--muted); }
+.page-tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid var(--line); margin: 1rem 0; }
+.page-tab { padding: 0.5rem 0.9rem; color: var(--muted); text-decoration: none; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; margin-bottom: -1px; }
+.page-tab[aria-selected="true"] { color: var(--fg); border-color: var(--line); background: var(--bg); font-weight: 600; }
+.card { border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 1rem 1rem; margin: 0 0 1rem; }
+.notice { border-left: 3px solid var(--accent); padding-left: 0.75rem; }
+.badge { display: inline-block; font-size: 0.75rem; font-weight: 600; padding: 0.05rem 0.4rem; border-radius: 4px; border: 1px solid var(--line); }
+.badge.caep { color: #1f6f43; border-color: #1f6f43; }
+.badge.risc { color: #8a3b12; border-color: #8a3b12; }
+.badge.ssf { color: var(--muted); }
+@media (prefers-color-scheme: dark) { .badge.caep { color: #7fd1a0; border-color: #7fd1a0; } .badge.risc { color: #f0a77a; border-color: #f0a77a; } }
+ol.log { list-style: none; padding: 0; margin: 0.5rem 0; }
+.log-item { border-top: 1px solid var(--line); padding: 0.6rem 0; }
+.log-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; }
+.log-top time { color: var(--muted); font-size: 0.875rem; margin-left: auto; }
+.log-outcome { margin: 0.25rem 0; }
+.log-outcome.ended { color: var(--problem); font-weight: 600; }
+table.members { margin: 0.25rem 0; }
+table.members th { width: 11rem; font-weight: 500; color: var(--muted); }
+form.inline { margin: 0.5rem 0; }
+button.secondary { background: transparent; color: var(--accent); }
+.empty { color: var(--muted); }
+.page-tab .count:not(:empty) { display: inline-block; min-width: 1.4em; padding: 0 0.35em; margin-left: 0.25em; border-radius: 999px; background: var(--accent); color: var(--bg); font-size: 0.75rem; text-align: center; }
+.log-item.fresh { animation: fresh 2.5s ease-out; }
+@keyframes fresh { from { background: color-mix(in srgb, var(--accent) 18%, transparent); } to { background: transparent; } }
+#live-state { font-weight: 600; }
+.accounts { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; padding: 0.5rem 0.75rem; border: 1px solid var(--line); border-radius: 8px; margin: 0.5rem 0 1rem; }
+.accounts ul { display: inline-flex; flex-wrap: wrap; gap: 0.35rem; list-style: none; margin: 0; padding: 0; }
+.accounts li a, .accounts li strong { display: inline-block; padding: 0.2rem 0.55rem; border-radius: 999px; border: 1px solid var(--line); text-decoration: none; }
+.accounts li[aria-current] strong { border-color: var(--accent); color: var(--accent); }
+.accounts-label { color: var(--muted); font-size: 0.875rem; }
+.button.small, button.small { padding: 0.3rem 0.6rem; font-size: 0.875rem; }
+details.card > summary { cursor: pointer; list-style-position: outside; }
+details.card > summary h2 { display: inline; font-size: 1.1rem; margin: 0.5rem 0; }
+details.card > summary .aside { color: var(--muted, #666); font-size: 0.85rem; margin-left: 0.5rem; }
+ul.checks { list-style: none; padding: 0; margin: 0.5rem 0; }
+ul.checks li { padding: 0.25rem 0; border-bottom: 1px solid var(--line); }
+.muted { color: var(--muted, #666); }
+pre.output { white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(127, 127, 127, 0.08); border: 1px solid var(--line); border-radius: 6px; padding: 0.6rem; font-size: 0.82rem; }
+form.inline { display: inline-block; margin: 0.25rem 0.5rem 0.5rem 0; }
+details.card h3 { font-size: 1rem; margin: 1rem 0 0.25rem; }
+/* The top bar and its user menu, after the browser library's demo. */
+header.topbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.site-nav { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; margin-right: auto; margin-left: 1.5rem; font-size: 0.9rem; }
+.site-nav a { text-decoration: none; }
+.site-nav a:hover, .site-nav a:focus-visible { text-decoration: underline; }
+.acct-menu { position: relative; font-size: 0.9rem; }
+.acct-menu > summary { list-style: none; display: flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0.6rem 0.2rem 0.2rem; border: 1px solid var(--line); border-radius: 999px; cursor: pointer; }
+.acct-menu > summary::-webkit-details-marker { display: none; }
+.acct-menu > summary:hover, .acct-menu[open] > summary { border-color: var(--accent); }
+.avatar { flex: none; width: 1.75rem; height: 1.75rem; border-radius: 50%; display: grid; place-items: center; font-weight: 600; font-size: 0.8rem; color: var(--accent); background: rgba(42, 93, 176, 0.12); }
+.avatar.plus { background: transparent; color: var(--muted); border: 1px dashed var(--line); }
+.menu-name { max-width: 18rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.caret { color: var(--muted); }
+.acct-menu .menu { position: absolute; right: 0; top: calc(100% + 0.4rem); z-index: 10; min-width: 18rem; max-width: 24rem; padding: 0.3rem; border: 1px solid var(--line); border-radius: 8px; background: var(--bg, #fff); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15); }
+.menu-head { margin: 0.4rem 0.6rem 0.25rem; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.menu-row { display: flex; align-items: center; gap: 0.6rem; width: 100%; box-sizing: border-box; padding: 0.45rem 0.6rem; border: 0; border-radius: 6px; background: transparent; color: var(--fg); font: inherit; text-align: left; text-decoration: none; cursor: pointer; }
+.menu-row:hover, .menu-row:focus-visible { background: rgba(42, 93, 176, 0.1); outline: none; }
+.menu-row.static { cursor: default; }
+.menu-row.static:hover { background: transparent; }
+.menu-who { display: flex; flex-direction: column; min-width: 0; }
+.menu-who > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-note { margin: 0.2rem 0.6rem 0.4rem; }
+.menu-sep { height: 1px; background: var(--line); margin: 0.3rem 0.2rem; }
+.acct-menu form { margin: 0; }
+.small { font-size: 0.8rem; }
+.pane-tools { display: flex; justify-content: flex-end; margin: 0 0 0.5rem; }
+button.small { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
+
+/* hidden means hidden, whatever a rule above sets for the element (button is inline-block). */
+[hidden] { display: none !important; }
+.warning { border: 1px solid #b7791f; border-left-width: 4px; border-radius: 6px; padding: 0.6rem 0.8rem; margin: 0 0 1rem; background: rgba(183, 121, 31, 0.08); }

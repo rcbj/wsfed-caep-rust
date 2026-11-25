@@ -73,7 +73,7 @@ fn sign_in_cleanup_and_logout() {
     let (status, _, page) = app.handle("GET", "/", &header(&[("cookie", &format!("sid={sid}"))]), b"");
     assert_eq!(status, 200);
     let page = String::from_utf8_lossy(&page);
-    assert!(page.contains("Signed in as <strong>alice-1234</strong>"), "{page}");
+    assert!(page.contains("<h1>Signed in as alice-1234</h1>"), "{page}");
     assert!(page.contains(crate::test_support::IDP_ENTITY), "{page}");
     let (status, fields, _) = app.handle("GET", "/wsfed?wa=wsignoutcleanup1.0", &header(&[("cookie", &format!("sid={sid}"))]), b"");
     assert_eq!(status, 200);

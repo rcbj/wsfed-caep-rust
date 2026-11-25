@@ -61,3 +61,5 @@ mod test_pep;
 mod test_authzen;
 #[cfg(test)]
 mod test_demo_pep;
+#[cfg(test)]
+mod test_demo;
