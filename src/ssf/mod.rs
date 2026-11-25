@@ -7,5 +7,5 @@ mod receiver;
 mod session;
 
 pub use jws::verify_compact_jws;
-pub use receiver::{ReceiverOptions, SignalEvent, SignalsLog, SignalsReceiver, TlsConfig};
+pub use receiver::{ReceiverOptions, SignalEvent, SignalsLog, SignalsReceiver, SubjectsHealth, TlsConfig};
 pub use session::{MemorySessionIndex, Session};

@@ -24,6 +24,36 @@ pub struct Resolved {
     pub certificate: Option<IdpCert>,
     pub idp_ca: String,
     pub idp_entity_id: String,
+    /// The `pep` section (the embedded iya-sts PEP, the `pep` feature), with a
+    /// relative `assertionKey` made absolute against the configuration's
+    /// directory. `None` when the configuration has none.
+    pub pep: Option<Value>,
+    /// The Shared Signals receiver's own TLS client identity
+    /// (`ssf.clientCertificate`, a PEM chain with the leaf first, and
+    /// `ssf.clientKey`), separate from the WS-Federation key pair. Both
+    /// empty when the configuration names none; see `ssf_tls_client`.
+    pub ssf_client_certificate: String,
+    pub ssf_client_key: String,
+}
+
+impl Resolved {
+    /// The certificate chain and private key (PEM) the Shared Signals
+    /// receiver authenticates with at the transmitter (mutual TLS):
+    /// `ssf.clientCertificate` and `ssf.clientKey` when the configuration
+    /// gives them (iya-sts's install script has the realm issue them), else
+    /// the relying party's own `certificate` and `privateKey`. `None` when
+    /// there is neither.
+    pub fn ssf_tls_client(&self) -> Option<(String, String)> {
+        if !self.ssf_client_certificate.is_empty() && !self.ssf_client_key.is_empty() {
+            return Some((self.ssf_client_certificate.clone(), self.ssf_client_key.clone()));
+        }
+        use rsa::pkcs8::EncodePrivateKey;
+        let certificate = self.certificate.as_ref()?;
+        let key = self.private_key.as_ref()?.to_pkcs8_der().ok()?;
+        let cert_pem = pem::encode(&pem::Pem::new("CERTIFICATE", certificate.der.clone()));
+        let key_pem = pem::encode(&pem::Pem::new("PRIVATE KEY", key.as_bytes().to_vec()));
+        Some((cert_pem, key_pem))
+    }
 }
 
 fn is_pem(value: &str) -> bool { value.contains("-----BEGIN ") }
@@ -99,7 +129,8 @@ pub fn resolve_config(config: &Map<String, Value>, base_dir: &Path) -> Result<Re
     let mut out = Resolved {
         realm, reply_url: reply, idp_metadata: meta, clock_skew_ms: skew_ms,
         want_assertions_encrypted: want, allow_unsolicited: allow, request_token_type: request_type,
-        signals_set: false, signals: true, private_key: None, certificate: None, idp_ca: String::new(), idp_entity_id: String::new(),
+        signals_set: false, signals: true, private_key: None, certificate: None, idp_ca: String::new(), idp_entity_id: String::new(), pep: None,
+        ssf_client_certificate: String::new(), ssf_client_key: String::new(),
     };
     if !signals {
         out.signals_set = true;
@@ -131,7 +162,61 @@ pub fn resolve_config(config: &Map<String, Value>, base_dir: &Path) -> Result<Re
     if let Some(id) = config.get("idpEntityId").and_then(|item| item.as_str()) {
         if !id.is_empty() { out.idp_entity_id = id.to_string(); }
     }
+    if let Some(ssf) = config.get("ssf").and_then(|item| item.as_object()) {
+        let text = |name: &str| -> Result<Option<String>> {
+            match ssf.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.trim().to_string())),
+                Some(_) => Err(fail("config", format!("ssf.{name} must be a PEM or a file path"))),
+            }
+        };
+        match (text("clientCertificate")?, text("clientKey")?) {
+            (None, None) => {}
+            (Some(cert), Some(key)) => {
+                let cert_pem = material(&cert, base_dir, "ssf.clientCertificate")?;
+                let key_pem = material(&key, base_dir, "ssf.clientKey")?;
+                if let Some(problem) = crate::httpclient::client_identity_problem(&cert_pem, &key_pem) {
+                    return Err(fail("config", format!("ssf.clientCertificate and ssf.clientKey are not a TLS client identity: {problem}")));
+                }
+                out.ssf_client_certificate = cert_pem;
+                out.ssf_client_key = key_pem;
+            }
+            _ => return Err(fail("config", "ssf.clientCertificate and ssf.clientKey go together: give both or neither")),
+        }
+    }
+    if let Some(section) = config.get("pep").filter(|item| !item.is_null()) {
+        // Refused rather than ignored: a build without the PEP would otherwise
+        // run with every decision the section asked for silently missing.
+        #[cfg(not(feature = "pep"))]
+        {
+            let _ = section;
+            return Err(fail("config", "pep is configured, and this build has no embedded PEP (the wsfed-caep `pep` feature)"));
+        }
+        #[cfg(feature = "pep")]
+        {
+            out.pep = Some(pep_section(section, base_dir));
+        }
+    }
     Ok(out)
+}
+
+/// The `pep` section as iya-pep reads it, with `assertionKey` (a path the PEP
+/// reads again when the key rotates) resolved like this file's other key
+/// references: a `file:` prefix dropped and a relative path taken from the
+/// configuration's directory. Everything else is checked by iya-pep.
+#[cfg(feature = "pep")]
+fn pep_section(section: &Value, base_dir: &Path) -> Value {
+    let mut section = section.clone();
+    if let Some(key) = section.get("assertionKey").and_then(|item| item.as_str()) {
+        let key = key.strip_prefix("file:").unwrap_or(key);
+        if !key.is_empty() && !Path::new(key).is_absolute() {
+            let full = base_dir.join(key).to_string_lossy().into_owned();
+            section["assertionKey"] = Value::String(full);
+        } else {
+            section["assertionKey"] = Value::String(key.to_string());
+        }
+    }
+    section
 }
 
 pub fn read_config_file(path: &str, overrides: Option<&Map<String, Value>>) -> Result<Resolved> {

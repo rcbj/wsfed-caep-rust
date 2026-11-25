@@ -31,6 +31,28 @@ it. Nothing here fetches the CA for the demo, rewrites idpCa, or mounts a CA int
 the demo container: only the key pair and the IdP metadata are mounted, file by
 file. This script reads the saved chain for its own HTTPS client.
 
+--pep (or LIVE_PEP=1) adds the demo's embedded PEP (#40), and needs an iya-sts
+with #2026-#2028 (IYA_STS_IMAGE). The PEP is set up the way a user sets it up:
+the install script runs with --pep central (the service account, a P-256 key in
+demo/generated, 0600, never printed and never in the image, its certificate
+bound to the demo's application, the catalogue row and the application's own
+policy, enforced; never the realm root) and writes the pep section; a copy,
+demo/wsfed.pep-local.json, says local. The demo runs central first: after the
+sign-in GET /orders/42 must be 200 and POST /orders/42 403. After the two
+events it runs again with WSFED_CONFIG naming the local copy: the same two,
+then the application's own policy is rewritten to deny read, and within
+PEP_FLIP_TIMEOUT seconds (30) the GET must be 403 with pep-policies-changed
+received (the fallback poll stays at 300 s, so `via` is `event`).
+
+With --pep a second test user, wsfed-demo-user-denied, is created after the
+install script (which defines attr1 and gives the first user attr1=abc123) with
+attr1=not-abc123. In each mode GET /attribute-protected must be 200 for the
+first user and 403 (a Deny) for the denied one, who still reads /orders/42.
+
+--authzen (or LIVE_AUTHZEN=1) runs scripts/live_authzen.py instead.
+--ui (or LIVE_UI=1) runs scripts/live_ui.py instead: the same provisioning with
+--pep local, then a real headless browser through the demo's pages.
+
 IYA_STS_URL, when set, uses an iya-sts that is already running and does not
 stop it. This script never removes iya-sts-live-main, iya-sts-live-probe, or a
 container whose name starts with sts. Otherwise it clones main (or builds
@@ -580,7 +602,7 @@ def wait_for(driver, predicate, what):
     raise RuntimeError(f"timed out waiting for {what}: {json.dumps(last)[:600]}")
 
 
-def prepare_sts(sts_port, secret):
+def prepare_sts(sts_port, secret, name=None):
     given = os.environ.get("IYA_STS_URL", "").rstrip("/")
     if given:
         print(f"using {given}", flush=True)
@@ -598,7 +620,7 @@ def prepare_sts(sts_port, secret):
             source = cloned
         image = "iya-sts-live:main"
         docker("build", "-t", image, source)
-    name = "iya-sts-live-" + PROFILE["repo"]
+    name = name or "iya-sts-live-" + PROFILE["repo"]
     docker_rm(name)
     # The secret passes by name (-e NAME, the value in this child's environment):
     # it is neither on the printed command line nor written to a file.
@@ -620,7 +642,7 @@ def prepare_sts(sts_port, secret):
     return f"https://127.0.0.1:{sts_port}", name
 
 
-def generate_keys(image, work, config):
+def generate_keys(image, work, config, realm=""):
     """Write the relying-party key pair with this crate's CLI inside the demo image."""
     (work / "generated").mkdir(parents=True, exist_ok=True)
     docker(
@@ -630,10 +652,12 @@ def generate_keys(image, work, config):
         "-w", "/work",
         image,
         "wsfed-caep", "generate-keys", "--config", "/work/" + config.name,
+        # The realm as the demo will serve it: the image's own PORT (3000) would move it.
+        *(["--realm", realm] if realm else []),
     )
 
 
-def configure_demo(config, sts_origin, demo_origin, username, password, secret):
+def configure_demo(config, sts_origin, demo_origin, username, password, secret, pep=None):
     """Register the relying party with the host's python3. It imports nothing outside the standard library."""
     env = os.environ.copy()
     env["ADMIN_API_CLIENT_SECRET"] = secret
@@ -648,6 +672,7 @@ def configure_demo(config, sts_origin, demo_origin, username, password, secret):
             "--idp", sts_origin,
             "--public-url", demo_origin,
             "--test-user", username,
+            *(["--pep", pep] if pep else []),
         ],
         cwd=str(ROOT),
         env=env,
@@ -659,15 +684,276 @@ def configure_demo(config, sts_origin, demo_origin, username, password, secret):
         print(completed.stderr, file=sys.stderr, flush=True)
 
 
-def main():
-    sts_port = int(os.environ.get("LIVE_STS_PORT") or 18517)
-    demo_port = int(os.environ.get("LIVE_DEMO_PORT") or 18617)
-    sts_given = bool(os.environ.get("IYA_STS_URL", "").strip())
+# The embedded PEP (#40): its names, key path and policy are the install script's.
+from configure_iya_sts import PEP_EVENT, PEP_KEY, TEST_ATTRIBUTE, TEST_ATTRIBUTE_VALUE, orders_policy  # noqa: E402
+
+PEP_LOCAL_CONFIG = "wsfed.pep-local.json"
+# The second test user: signed in like the first, but its attr1 is not abc123, so the demo
+# application's policy denies it GET /attribute-protected (403) and still permits GET /orders/42.
+DENIED_USER = PROFILE["test_user"] + "-denied"
+DENIED_VALUE = "not-" + TEST_ATTRIBUTE_VALUE
+
+
+def create_denied_user(client, sts_origin, secret, password):
+    """The denied test user, with attr1=not-abc123. Runs after the install script, which defines
+    the realm's custom attribute attr1. The password is never printed."""
+    token = mint_admin(client, sts_origin, secret)
+    status, made = admin_json(client, sts_origin, token, "POST", "/admin-api/users/create", {
+        "username": DENIED_USER, "invent": False, "credential": "password", "password": password, "passwordConfirm": password,
+        "attributes": {"cn": "WS-Fed Demo denied", "givenName": "WS-Fed", "sn": "Denied", "displayName": "WS-Fed Demo denied",
+                       "mail": DENIED_USER + "@wsfed-demo.test"},
+    })
+    if status != 200 or made.get("ok") is False:
+        made.pop("password", None)
+        raise RuntimeError(f"creating {DENIED_USER} answered {status}: {json.dumps(made)[:400]}")
+    print(f"created the denied test user {DENIED_USER}", flush=True)
+    admin_ok(client, sts_origin, token, "/admin-api/users/set-attribute",
+             {"user": DENIED_USER, "attribute": TEST_ATTRIBUTE, "value": DENIED_VALUE},
+             f"{DENIED_USER} has {TEST_ATTRIBUTE}={DENIED_VALUE}")
+
+
+def admin_ok(client, sts_origin, token, path, body, what):
+    status, parsed = admin_json(client, sts_origin, token, "POST", path, body)
+    if status != 200 or parsed.get("ok") is False:
+        raise RuntimeError(f"{what}: POST {path} answered {status}: {json.dumps(parsed)[:500]}")
+    print(f"{what}: {status}", flush=True)
+    return parsed
+
+
+def local_copy(config, dest):
+    """The install script wrote a central pep section; a copy says local."""
+    raw = json.loads(config.read_text(encoding="utf-8"))
+    if not isinstance(raw.get("pep"), dict) or raw["pep"].get("mode") != "central":
+        raise RuntimeError(f"the install script did not write a central pep section: {json.dumps(raw.get('pep'))}")
+    raw["pep"] = dict(raw["pep"], mode="local")
+    dest.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    return raw["realm"]
+
+
+def flip_policy(client, sts_origin, token, application):
+    """The application's own policy (the install script's) now denies read too. The realm root is
+    never touched."""
+    status, page = admin_json(client, sts_origin, token, "GET",
+                              "/admin-api/applications?application=" + urllib.parse.quote(application, safe=""))
+    fga = ((page.get("page") or {}).get("fga") or {}) if status == 200 else {}
+    name = (fga.get("policy") or {}).get("name") or fga.get("reference")
+    if not name or fga.get("enforced") is not True:
+        raise RuntimeError(f"the application does not enforce a policy of its own: {json.dumps(fga)[:400]}")
+    admin_ok(client, sts_origin, token, "/admin-api/xacml/import-alfa",
+             {"name": name, "alfa": orders_policy("wsfeddemolocked", "deny")},
+             "the application's own policy now denies read on an order")
+
+
+def order(driver, method):
+    url = driver.demo_origin + "/orders/42"
+    status, _headers, payload = driver.client.request(method, url, body=b"" if method == "POST" else None,
+                                                      headers={"accept": "text/html"})
+    print(f"{method} {status} demo /orders/42", flush=True)
+    return status, payload
+
+
+def page(driver, method, path):
+    url = driver.demo_origin + path
+    status, _headers, payload = driver.client.request(method, url, body=b"" if method == "POST" else None,
+                                                      headers={"accept": "text/html"})
+    print(f"{method} {status} demo {path}", flush=True)
+    return status, payload.decode("utf-8", "replace")
+
+
+def attribute_checks(driver, allowed):
+    """GET /attribute-protected: the allowed user (attr1=abc123) 200, the denied user
+    (attr1=not-abc123) 403 by a Deny, not a failure; the denied user still reads order 42."""
+    status, body = page(driver, "GET", "/attribute-protected")
+    if allowed:
+        ok = status == 200 and "<h1>Allowed</h1>" in body
+        checks = {"attributeProtectedIs200": ok}
+    else:
+        ok = status == 403 and "<h1>Not allowed</h1>" in body and "could not decide" not in body
+        read_status, read_body = page(driver, "GET", "/orders/42")
+        checks = {"user": DENIED_USER, "attributeProtectedIs403": ok, "readIs200": read_status == 200}
+        if read_status != 200:
+            raise RuntimeError(f"the denied user: GET /orders/42 answered {read_status}: {read_body[:400]}")
+    if not ok:
+        who = "the allowed user" if allowed else "the denied user"
+        raise RuntimeError(f"{who}: GET /attribute-protected answered {status}: {body[:600]}")
+    return checks
+
+
+def pep_checks(driver, mode):
+    """GET is read (Permit, 200) and POST is write (Deny, 403); GET /attribute-protected is 200."""
+    deadline = time.time() + 60
+    state = {}
+    while time.time() < deadline:
+        state = driver.status().get("pep") or {}
+        if state.get("registered") and (mode == "central" or state.get("holdsPolicy")):
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError(f"the {mode} PEP did not get ready: {json.dumps(state)[:600]}")
+    read_status, read_body = order(driver, "GET")
+    write_status, write_body = order(driver, "POST")
+    checks = {"mode": state.get("mode"), "registered": bool(state.get("registered")),
+              "readIs200": read_status == 200, "writeIs403": write_status == 403}
+    if mode == "local":
+        checks["policyCount"] = state.get("policyCount")
+    if state.get("mode") != mode or read_status != 200 or write_status != 403:
+        why = (read_body if read_status != 200 else write_body)[:400].decode("utf-8", "replace")
+        raise RuntimeError(f"{mode}: GET /orders/42 answered {read_status}, POST {write_status}: {why}; pep {json.dumps(state)[:600]}")
+    checks.update(attribute_checks(driver, allowed=True))
+    return checks
+
+
+def denied_checks(sts_origin, demo_origin, ca_file, password):
+    """The denied user signs in with a browser of its own (its own cookies) and is checked."""
+    denied = Driver(Client(ca_file), sts_origin, demo_origin, DENIED_USER, password)
+    denied.sign_in()
+    wait_for(denied, lambda row: row.get("signedIn") is True, "the denied user signed in")
+    return attribute_checks(denied, allowed=False)
+
+
+def flip_check(driver, client, sts_origin, token, application):
+    """local: the application's policy moves to deny read, and the PEP hears of it by event."""
+    before = driver.status().get("pep") or {}
+    events_before = sum(1 for item in driver.status().get("events") or [] if item.get("type") == PEP_EVENT)
+    flipped_at = time.time()
+    flip_policy(client, sts_origin, token, application)
+    limit = float(os.environ.get("PEP_FLIP_TIMEOUT") or 30)
+    status = None
+    while time.time() - flipped_at < limit:
+        status, _body = order(driver, "GET")
+        if status == 403:
+            break
+        time.sleep(1)
+    after = driver.status()
+    state = after.get("pep") or {}
+    events = sum(1 for item in after.get("events") or [] if item.get("type") == PEP_EVENT)
+    result = {
+        "readIs403AfterFlip": status == 403,
+        "seconds": round(time.time() - flipped_at, 1),
+        "eventReceived": events > events_before,
+        "syncTokenMoved": bool(state.get("syncToken")) and state.get("syncToken") != before.get("syncToken"),
+        "policyEvents": state.get("policyEvents"),
+    }
+    # The fallback poll is left at its 300 s default, so a change applied
+    # within the bound, with the event received, came through the event.
+    result["via"] = "event" if result["eventReceived"] and result["readIs403AfterFlip"] and result["seconds"] < 300 else "poll"
+    if status != 403 or result["via"] != "event":
+        raise RuntimeError(f"local: after the flip {json.dumps(result)}; pep {json.dumps(state)[:600]}")
+    return result
+
+
+def start_demo(image, demo_name, demo_port, demo_origin, mounts, env=None):
+    """A fresh demo container with only `mounts`, file by file and read-only."""
+    docker_rm(demo_name)
+    args = ["run", "-d", "--name", demo_name, "--network", "host", "--user", f"{os.getuid()}:{os.getgid()}"]
+    for source, target in mounts:
+        args += ["-v", f"{source}:{target}:ro"]
+    args += ["-e", f"PORT={demo_port}", "-e", f"PUBLIC_URL={demo_origin}"]
+    for name, value in (env or {}).items():
+        args += ["-e", f"{name}={value}"]
+    docker(*args, image)
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", demo_port, timeout=3)
+            conn.request("GET", "/healthz")
+            response = conn.getresponse()
+            body = response.read()
+            conn.close()
+            if response.status == 200 and body == b"ok":
+                return
+        except OSError:
+            pass
+        time.sleep(1)
+    logs = subprocess.run(["docker", "logs", demo_name], check=False, text=True, capture_output=True)
+    if logs.stdout:
+        print(logs.stdout, flush=True)
+    if logs.stderr:
+        print(logs.stderr, file=sys.stderr, flush=True)
+    raise RuntimeError("the demo /healthz did not answer ok")
+
+
+def provision(work, sts_origin, demo_origin, username, password, secret, image, pep=None, denied_password=None):
+    """What a user does, in order: the checkout copied to a build context, the demo image built,
+    the key pair generated inside it, the install script (with --pep `pep`), the image built
+    again with the trust chain, and the image's demo/generated checked. With a
+    `denied_password`, the denied test user is created after the install script. Answers what
+    the demo needs to run."""
+    context = work / "context"
+    copy_context(context)
+    demo_dir = context / "demo"
+    config = demo_dir / "wsfed.json"
+    rewrite_config(ROOT / PROFILE["config_file"], config, sts_origin, demo_origin)
+    # Built once without a chain (as a fresh clone would be) for the key pair;
+    # the registrar writes the chain where idpCa names it; built again, which
+    # changes only the demo/ layer.
+    docker("build", "-t", image, str(context))
+    generate_keys(image, demo_dir, config, json.loads(config.read_text(encoding="utf-8"))["realm"])
+    configure_demo(config, sts_origin, demo_origin, username, password, secret, pep=pep)
+    ca_file = demo_dir / "generated" / "idp-ca.pem"
+    if not ca_file.exists():
+        raise RuntimeError(f"the registrar did not write {ca_file}")
+    out = {"demo_dir": demo_dir, "config": config, "ca_file": ca_file, "pep": {}}
+    pep_key = demo_dir / PEP_KEY
+    if pep:
+        # The install script set the PEP up and wrote its section; for a
+        # central run, a copy says local. Both go into the image; the key never does.
+        if not pep_key.exists():
+            raise RuntimeError("the install script did not make the PEP's key")
+        written = json.loads(config.read_text(encoding="utf-8"))
+        if (written.get("pep") or {}).get("mode") != pep:
+            raise RuntimeError(f"the install script did not write a {pep} pep section: {json.dumps(written.get('pep'))}")
+        out["pep"]["application"] = local_copy(config, demo_dir / PEP_LOCAL_CONFIG) if pep == "central" else written["realm"]
+        out["pep"]["name"] = written["pep"]["name"]
+    if denied_password:
+        create_denied_user(Client(ca_file), sts_origin, secret, denied_password)
+    docker("build", "-t", image, str(context))
+    listed = docker("run", "--rm", image, "ls", "-A", "demo/generated", capture_output=True).stdout.split()
+    if listed != ["idp-ca.pem"]:
+        raise RuntimeError(f"the demo image's demo/generated holds {listed}, not only the trust chain")
+    baked = docker("run", "--rm", image, "cat", "demo/generated/idp-ca.pem", capture_output=True)
+    if baked.stdout != ca_file.read_text(encoding="utf-8"):
+        raise RuntimeError("the demo image does not carry the chain the registrar wrote")
+    out["chain_count"] = baked.stdout.count("BEGIN CERTIFICATE")
+    print(f"the demo image carries the {out['chain_count']}-certificate chain at /app/demo/generated/idp-ca.pem", flush=True)
+    mounts = [(demo_dir / "generated" / name, f"/app/demo/generated/{name}") for name in ("rp.key", "rp.crt", "idp-metadata.xml")]
+    # The receiver's realm-issued TLS client identity (ssf.clientCertificate/clientKey).
+    mounts += [(demo_dir / "generated" / name, f"/app/demo/generated/{name}") for name in ("ssf-client.key", "ssf-client.crt")
+               if (demo_dir / "generated" / name).exists()]
+    out["ssfClientCertificate"] = (demo_dir / "generated" / "ssf-client.crt").exists()
+    if pep:
+        mounts.append((pep_key, "/app/demo/" + PEP_KEY))
+    out["mounts"] = mounts
+    return out
+
+
+def rp_subject(demo_dir):
+    """The RP certificate's subject and SAN, as the host's openssl reads them (no secret)."""
+    done = subprocess.run(["openssl", "x509", "-in", str(demo_dir / "generated" / "rp.crt"), "-noout", "-subject", "-ext", "subjectAltName", "-nameopt", "RFC2253"],
+                          capture_output=True, text=True, check=False)
+    return " ".join(done.stdout.split()) if done.returncode == 0 else ""
+
+
+def checked_ports(sts_port, demo_port, sts_given):
     bound = [demo_port] if sts_given else [sts_port, demo_port]
     if any(port in FORBIDDEN_PORTS for port in bound) or len(set(bound)) != len(bound):
         raise SystemExit("LIVE_STS_PORT and LIVE_DEMO_PORT must not bind 3000, 8081, or 18481 to 18495")
+
+
+def main():
+    if "--authzen" in sys.argv[1:] or os.environ.get("LIVE_AUTHZEN", "") in ("1", "true", "yes"):
+        import live_authzen
+        return live_authzen.main()
+    if "--ui" in sys.argv[1:] or os.environ.get("LIVE_UI", "") in ("1", "true", "yes"):
+        import live_ui
+        return live_ui.main()
+    pep = "--pep" in sys.argv[1:] or os.environ.get("LIVE_PEP", "") in ("1", "true", "yes")
+    sts_port = int(os.environ.get("LIVE_STS_PORT") or 18517)
+    demo_port = int(os.environ.get("LIVE_DEMO_PORT") or 18617)
+    checked_ports(sts_port, demo_port, bool(os.environ.get("IYA_STS_URL", "").strip()))
     secret = os.environ.get("ADMIN_API_CLIENT_SECRET") or os.environ.get("STS_ADMIN_API_CLIENT_SECRET") or secrets.token_urlsafe(24)
     password = os.environ.get(PROFILE["password_env"]) or secrets.token_urlsafe(18)
+    denied_password = secrets.token_urlsafe(18) if pep else None
     username = PROFILE["test_user"]
     sts_origin, sts_name = prepare_sts(sts_port, secret)
     demo_origin = f"http://127.0.0.1:{demo_port}"
@@ -677,60 +963,10 @@ def main():
     try:
         wait_port(urllib.parse.urlsplit(sts_origin).port or 443, 120)
         wait_ready(sts_origin, 90)
-        context = work / "context"
-        copy_context(context)
-        demo_dir = context / "demo"
-        config = demo_dir / "wsfed.json"
-        rewrite_config(ROOT / PROFILE["config_file"], config, sts_origin, demo_origin)
-        # Built once without a chain (as a fresh clone would be) for the key pair;
-        # the registrar writes the chain where idpCa names it; built again, which
-        # changes only the demo/ layer.
-        docker("build", "-t", image, str(context))
-        generate_keys(image, demo_dir, config)
-        configure_demo(config, sts_origin, demo_origin, username, password, secret)
-        ca_file = demo_dir / "generated" / "idp-ca.pem"
-        if not ca_file.exists():
-            raise RuntimeError(f"the registrar did not write {ca_file}")
-        docker("build", "-t", image, str(context))
-        baked = docker("run", "--rm", image, "cat", "demo/generated/idp-ca.pem", capture_output=True)
-        if baked.stdout != ca_file.read_text(encoding="utf-8"):
-            raise RuntimeError("the demo image does not carry the chain the registrar wrote")
-        chain_count = baked.stdout.count("BEGIN CERTIFICATE")
-        print(f"the demo image carries the {chain_count}-certificate chain at /app/demo/generated/idp-ca.pem", flush=True)
-        docker_rm(demo_name)
-        mounts = []
-        for name in ("rp.key", "rp.crt", "idp-metadata.xml"):
-            mounts += ["-v", f"{demo_dir / 'generated' / name}:/app/demo/generated/{name}:ro"]
-        docker(
-            "run", "-d", "--name", demo_name, "--network", "host",
-            "--user", f"{os.getuid()}:{os.getgid()}",
-            *mounts,
-            "-e", f"PORT={demo_port}",
-            "-e", f"PUBLIC_URL={demo_origin}",
-            image,
-        )
-        deadline = time.time() + 90
-        healthy = False
-        while time.time() < deadline:
-            try:
-                conn = http.client.HTTPConnection("127.0.0.1", demo_port, timeout=3)
-                conn.request("GET", "/healthz")
-                response = conn.getresponse()
-                body = response.read()
-                conn.close()
-                if response.status == 200 and body == b"ok":
-                    healthy = True
-                    break
-            except OSError:
-                pass
-            time.sleep(1)
-        if not healthy:
-            logs = subprocess.run(["docker", "logs", demo_name], check=False, text=True, capture_output=True)
-            if logs.stdout:
-                print(logs.stdout, flush=True)
-            if logs.stderr:
-                print(logs.stderr, file=sys.stderr, flush=True)
-            raise RuntimeError("the demo /healthz did not answer ok")
+        made = provision(work, sts_origin, demo_origin, username, password, secret, image,
+                         pep="central" if pep else None, denied_password=denied_password)
+        ca_file, mounts, chain_count, pep_result = made["ca_file"], made["mounts"], made["chain_count"], made["pep"]
+        start_demo(image, demo_name, demo_port, demo_origin, mounts)
         client = Client(ca_file)
         driver = Driver(client, sts_origin, demo_origin, username, password)
         driver.sign_in()
@@ -740,6 +976,9 @@ def main():
             "a signed-in demo polling its stream",
         )
         print(f"signed in as {signed_in.get('subject')}; {signed_in.get('receiver')}", flush=True)
+        if pep:
+            pep_result["central"] = pep_checks(driver, "central")
+            pep_result["central"]["denied"] = denied_checks(sts_origin, demo_origin, ca_file, denied_password)
         token = mint_admin(client, sts_origin, secret)
         session_id = session_id_for(client, sts_origin, token, username)
         emit(client, sts_origin, token, session_id, "credential-change")
@@ -758,7 +997,22 @@ def main():
             ),
             "session-revoked to end the local session",
         )
-        print(json.dumps({"ok": True, "subject": signed_in.get("subject"), "idpCaInImage": chain_count, "events": finished.get("events")}, indent=2))
+        result = {"ok": True, "subject": signed_in.get("subject"), "idpCaInImage": chain_count, "events": finished.get("events"),
+                  "ssfClientCertificate": made["ssfClientCertificate"], "rpCertificate": rp_subject(made["demo_dir"])}
+        if pep:
+            # THEN local: the same image and iya-sts, the copy that says local.
+            start_demo(image, demo_name, demo_port, demo_origin, mounts, env={"WSFED_CONFIG": "demo/" + PEP_LOCAL_CONFIG})
+            local_driver = Driver(Client(ca_file), sts_origin, demo_origin, username, password)
+            local_driver.sign_in()
+            wait_for(local_driver, lambda row: row.get("signedIn") is True and "polling" in str(row.get("receiver") or ""),
+                     "a signed-in local-mode demo polling its stream")
+            local = pep_checks(local_driver, "local")
+            local["denied"] = denied_checks(sts_origin, demo_origin, ca_file, denied_password)
+            token = mint_admin(client, sts_origin, secret)
+            local["policyChange"] = flip_check(local_driver, client, sts_origin, token, pep_result["application"])
+            pep_result["local"] = local
+            result["pep"] = pep_result
+        print(json.dumps(result, indent=2))
     finally:
         docker_rm(demo_name)
         if sts_name:

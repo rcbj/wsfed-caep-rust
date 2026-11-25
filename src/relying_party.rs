@@ -60,21 +60,78 @@ pub struct RelyingParty {
     pub config: Resolved,
     pub idp: Option<IdpMetadata>,
     replay: MemoryReplayCache,
+    #[cfg(feature = "pep")]
+    pep: Option<std::sync::Arc<crate::pep::Pep>>,
 }
 
 impl RelyingParty {
     pub fn create(config: &Map<String, Value>, base_dir: &std::path::Path) -> Result<Self> {
         let resolved = config::resolve_config(config, base_dir)?;
-        let mut party = Self { config: resolved, idp: None, replay: MemoryReplayCache::new(0) };
-        party.refresh_metadata()?;
-        Ok(party)
+        Self::finish(resolved)
     }
 
     pub fn from_file(path: &str, overrides: Option<Map<String, Value>>) -> Result<Self> {
         let resolved = config::read_config_file(path, overrides.as_ref())?;
-        let mut party = Self { config: resolved, idp: None, replay: MemoryReplayCache::new(0) };
+        Self::finish(resolved)
+    }
+
+    fn finish(resolved: Resolved) -> Result<Self> {
+        let mut party = Self {
+            config: resolved,
+            idp: None,
+            replay: MemoryReplayCache::new(0),
+            #[cfg(feature = "pep")]
+            pep: None,
+        };
         party.refresh_metadata()?;
+        // The embedded PEP (iya-sts#1206), once the identity provider's
+        // entityID, the default pdpUrl, is known. Registration and (in local
+        // mode) the first pull happen in start(); an unreachable service is
+        // retried on the PEP's own thread, and decisions are Unavailable until
+        // then.
+        #[cfg(feature = "pep")]
+        {
+            let issuer = party.idp.as_ref().map(|idp| idp.entity_id.clone()).unwrap_or_default();
+            if let Some(pep) = crate::pep::build(&party.config, &issuer)? {
+                pep.start().map_err(|err| fail("config", err.message))?;
+                party.pep = Some(pep);
+            }
+        }
         Ok(party)
+    }
+
+    /// The embedded PEP, when the configuration has a `pep` section.
+    #[cfg(feature = "pep")]
+    pub fn pep(&self) -> Option<&std::sync::Arc<crate::pep::Pep>> {
+        self.pep.as_ref()
+    }
+
+    /// Decides one access for a validated sign-in with the embedded PEP. With
+    /// no `pep` section the answer is `Unavailable`: nothing here permits by
+    /// default.
+    #[cfg(feature = "pep")]
+    pub fn decide(&self, login: &Login, access: &crate::pep::Access) -> crate::pep::Decision {
+        match &self.pep {
+            Some(pep) => pep.decide(&crate::pep::subject_of(login), access),
+            None => crate::pep::Decision::Unavailable { why: "no pep section is configured".into() },
+        }
+    }
+
+    /// `decide` for the sign-in the application keeps under `local_id` and
+    /// tracks with `receiver` (`SignalsReceiver::track`). A session that ended
+    /// is denied without asking: one the receiver no longer tracks (signed
+    /// out and untracked, past its expiry, or ended by a Shared Signals event
+    /// such as CAEP `session-revoked`), or one whose identity provider session
+    /// (SessionNotOnOrAfter) is over.
+    #[cfg(feature = "pep")]
+    pub fn decide_session(&self, receiver: &crate::ssf::SignalsReceiver, local_id: &str, login: &Login, access: &crate::pep::Access) -> crate::pep::Decision {
+        if login.session_not_on_or_after.is_some_and(|until| until <= chrono::Utc::now()) {
+            return crate::pep::Decision::Deny { why: "the identity provider's session has ended".into() };
+        }
+        if !receiver.is_tracked(local_id) {
+            return crate::pep::Decision::Deny { why: "no signed-in session".into() };
+        }
+        self.decide(login, access)
     }
 
     pub fn refresh_metadata(&mut self) -> Result<&IdpMetadata> {

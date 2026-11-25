@@ -4,13 +4,13 @@
 use crate::config::parse_object;
 use crate::error::fail;
 use crate::relying_party::RelyingParty;
-use crate::x509util::{self, create_self_signed_key_pair};
+use crate::x509util::{self, create_named_key_pair, CertificateName};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "Usage:\n  wsfed-caep generate-keys --config <wsfed.json> [--cn <name>] [--days <n>] [--bits <n>] [--force]\n  wsfed-caep generate-keys --key <file> --cert <file> [--cn <name>] [--days <n>] [--bits <n>] [--force]\n      A new RSA key and a self-signed certificate, written where the configuration's privateKey and\n      certificate point (or to --key and --cert). Refuses to replace existing files without --force.\n      The key decrypts encrypted assertions and can authenticate the Shared Signals receiver (mutual\n      TLS); WS-Federation itself signs nothing. The common name defaults to one naming the realm.\n\n  wsfed-caep metadata --config <wsfed.json> [--out <file>]\n      This relying party's federation metadata, from the configuration (and its certificate, when it\n      has one): give it to the identity provider. Written to --out, or to standard output.";
+const USAGE: &str = "Usage:\n  wsfed-caep generate-keys --config <wsfed.json> [--realm <url>] [--public-url <url>] [--cn <name>] [--days <n>] [--bits <n>] [--force]\n  wsfed-caep generate-keys --key <file> --cert <file> [--realm <url>] [--cn <name>] [--days <n>] [--bits <n>] [--force]\n      A new RSA key and a self-signed certificate, written where the configuration's privateKey and\n      certificate point (or to --key and --cert). Refuses to replace existing files without --force.\n      The key decrypts encrypted assertions, and authenticates the Shared Signals receiver only when\n      the configuration names no ssf.clientCertificate; WS-Federation itself signs nothing. The\n      subject is CN=wsfed-caep-rust demo RP (or --cn), OU=<realm>, and a subjectAltName URI is the\n      realm. The realm is --realm, else the configuration's moved as the demo moves it: --public-url\n      or PUBLIC_URL replaces its origin, else PORT replaces a loopback port.\n\n  wsfed-caep metadata --config <wsfed.json> [--out <file>]\n      This relying party's federation metadata, from the configuration (and its certificate, when it\n      has one): give it to the identity provider. Written to --out, or to standard output.";
 
 fn parse_cli(argv: &[String]) -> std::result::Result<(String, HashMap<String, String>), String> {
     if argv.is_empty() { return Ok((String::new(), HashMap::new())); }
@@ -44,11 +44,25 @@ fn strip_file(value: &str) -> &str {
     value.strip_prefix("file:").unwrap_or(value)
 }
 
-fn key_paths(args: &HashMap<String, String>) -> std::result::Result<(String, String, String), String> {
+/// The common name `generate-keys` gives the relying party's certificate.
+pub const DEFAULT_COMMON_NAME: &str = "wsfed-caep-rust demo RP";
+
+/// The realm the demo serves for `configured`, as `demo::endpoints_for`
+/// moves it: `--public-url`/PUBLIC_URL replaces the origin, else PORT
+/// replaces a loopback port.
+pub(crate) fn running_realm(configured: &str, args: &HashMap<String, String>) -> String {
+    let public = args.get("public-url").cloned().or_else(|| std::env::var("PUBLIC_URL").ok()).unwrap_or_default();
+    let public = public.trim_end_matches('/').to_string();
+    let port = std::env::var("PORT").ok().and_then(|text| text.parse::<u16>().ok()).unwrap_or(0);
+    crate::demo::endpoints_for(configured, "", &public, !public.is_empty(), port).0
+}
+
+fn key_paths(args: &HashMap<String, String>) -> std::result::Result<(String, String, CertificateName), String> {
     let config_path = args.get("config").cloned().unwrap_or_default();
     let mut key = args.get("key").cloned().unwrap_or_default();
     let mut cert = args.get("cert").cloned().unwrap_or_default();
-    let mut common_name = args.get("cn").cloned().unwrap_or_default();
+    let common_name = args.get("cn").cloned().filter(|value| !value.is_empty()).unwrap_or_else(|| DEFAULT_COMMON_NAME.to_string());
+    let mut realm = args.get("realm").cloned().unwrap_or_default();
     if !config_path.is_empty() {
         let raw = std::fs::read_to_string(&config_path).map_err(|err| err.to_string())?;
         let parsed = parse_object(&raw).map_err(|err| err.to_string())?;
@@ -71,9 +85,9 @@ fn key_paths(args: &HashMap<String, String>) -> std::result::Result<(String, Str
                 if !text.is_empty() { cert = at(text, "certificate")?; }
             }
         }
-        if common_name.is_empty() {
-            if let Some(realm) = parsed.get("realm").and_then(|item| item.as_str()) {
-                if !realm.is_empty() { common_name = clip_runes(&format!("wsfed-caep-nodejs relying party {realm}"), 64); }
+        if realm.is_empty() {
+            if let Some(configured) = parsed.get("realm").and_then(|item| item.as_str()) {
+                if !configured.is_empty() { realm = running_realm(configured, args); }
             }
         }
     }
@@ -82,8 +96,8 @@ fn key_paths(args: &HashMap<String, String>) -> std::result::Result<(String, Str
     }
     let key = std::fs::canonicalize(Path::new(&key).parent().unwrap_or(Path::new("."))).unwrap_or_else(|_| PathBuf::from(".")).join(Path::new(&key).file_name().unwrap_or_default());
     let cert_abs = std::fs::canonicalize(Path::new(&cert).parent().unwrap_or(Path::new("."))).unwrap_or_else(|_| PathBuf::from(".")).join(Path::new(&cert).file_name().unwrap_or_default());
-    if common_name.is_empty() { common_name = "wsfed-caep-nodejs relying party".to_string(); }
-    Ok((key.to_string_lossy().into_owned(), cert_abs.to_string_lossy().into_owned(), common_name))
+    let name = CertificateName { common_name: clip_runes(&common_name, 64), unit: clip_runes(&realm, 64), uri: realm };
+    Ok((key.to_string_lossy().into_owned(), cert_abs.to_string_lossy().into_owned(), name))
 }
 
 fn exists(path: &str) -> bool { Path::new(path).exists() }
@@ -115,7 +129,7 @@ pub fn main(argv: &[String], mut out: impl Write) -> i32 {
         if let Some(text) = args.get("bits") {
             match text.parse::<usize>() { Ok(2048) | Ok(3072) | Ok(4096) => bits = text.parse().unwrap_or(3072), _ => { eprintln!("--bits must be 2048, 3072 or 4096"); return 1; } }
         }
-        let pair = match create_self_signed_key_pair(&common_name, days, bits) {
+        let pair = match create_named_key_pair(&common_name, days, bits) {
             Ok(value) => value,
             Err(err) => { eprintln!("{err}"); return 1; }
         };
@@ -128,6 +142,9 @@ pub fn main(argv: &[String], mut out: impl Write) -> i32 {
         let _ = writeln!(out, "Wrote the private key  {key} (mode 600)");
         let _ = writeln!(out, "Wrote the certificate  {cert}");
         let _ = writeln!(out, "  subject   {}", x509util::subject_string(&pair.certificate_der));
+        for uri in x509util::subject_alt_uris(&pair.certificate_der) {
+            let _ = writeln!(out, "  SAN URI   {uri}");
+        }
         return 0;
     }
     if command == "metadata" {

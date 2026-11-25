@@ -3,7 +3,7 @@
 
 use super::events::{self, subject_of};
 use super::jws::verify_compact_jws;
-use super::session::{tracked_from, MemorySessionIndex};
+use super::session::{tracked_from, MemorySessionIndex, Session};
 use crate::error::{fail, Result, WsFedError};
 use crate::httpclient::{self, TlsMaterial};
 use crate::token::Login;
@@ -62,6 +62,20 @@ pub struct ReceiverOptions {
     pub poll_interval_ms: i64,
     pub max_events: i64,
     pub log: Option<Arc<dyn SignalsLog>>,
+    /// Tell the transmitter which subjects this receiver cares about (SSF 1.0
+    /// sections 8.1.3.2 and 8.1.3.3): Add Subject when `track` starts a local
+    /// session, Remove Subject when the last local session for that person
+    /// ends; with `pep` (when it wants events), the application
+    /// (`{format: opaque, id}`) at `start`, so `pep-policies-changed` still
+    /// reaches a stream that names people. Default true; skipped when the transmitter publishes no
+    /// `add_subject_endpoint` / `remove_subject_endpoint` or the receiver is
+    /// not running. The demo reads it from `ssf.addSubjects`.
+    pub add_subjects: bool,
+    /// The relying party's embedded PEP (`RelyingParty::pep`). In `local`
+    /// mode, or `central` with a Permit cache, the receiver asks its stream
+    /// for `pep-policies-changed` and hands each verified one to it.
+    #[cfg(feature = "pep")]
+    pub pep: Option<Arc<crate::pep::Pep>>,
 }
 
 impl Default for ReceiverOptions {
@@ -76,8 +90,25 @@ impl Default for ReceiverOptions {
             poll_interval_ms: 0,
             max_events: 0,
             log: None,
+            add_subjects: true,
+            #[cfg(feature = "pep")]
+            pep: None,
         }
     }
+}
+
+/// What the Add Subject and Remove Subject calls have done since the
+/// receiver was made (`SignalsReceiver::subjects_health`). A call is never
+/// retried: `refused` counts 4xx answers (a 403 is expected when the person's
+/// session at the transmitter is already gone), `failed` transport errors and
+/// 5xx. SSF 1.0 section 9.1: a 200 or 204 does not promise events.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubjectsHealth {
+    pub added: u64,
+    pub removed: u64,
+    pub refused: u64,
+    pub failed: u64,
+    pub last_error: String,
 }
 
 struct Flight {
@@ -108,6 +139,17 @@ pub struct SignalsReceiver {
     poll_interval_ms: i64,
     max_events: i64,
     log: Arc<dyn SignalsLog>,
+    add_subjects: bool,
+    subjects: Mutex<SubjectsHealth>,
+    /// The PEP whose policy events this stream carries, told by `start`
+    /// whether the stream does.
+    #[cfg(feature = "pep")]
+    pep: Option<Arc<crate::pep::Pep>>,
+    /// What the stream carries for the PEP (`requested` or `excluded`), once
+    /// `start` knows: a failed poll reports `down`, and the next good one
+    /// this again.
+    #[cfg(feature = "pep")]
+    pep_stream: Mutex<Option<crate::pep::EventStream>>,
     state: Mutex<State>,
     running: AtomicBool,
     inflight: Mutex<Option<Arc<Flight>>>,
@@ -126,11 +168,40 @@ impl SignalsReceiver {
             cert: if item.cert.is_empty() { None } else { Some(item.cert) },
             key: if item.key.is_empty() { None } else { Some(item.key) },
         });
+        #[allow(unused_mut)]
+        let mut events_requested = opts.events_requested.unwrap_or_else(events::default_events_requested);
+        #[allow(unused_mut)]
+        let mut handlers: HashMap<String, Vec<HandlerFn>> = HashMap::new();
+        #[cfg(feature = "pep")]
+        let mut event_pep = None;
+        #[cfg(feature = "pep")]
+        if let Some(pep) = opts.pep {
+            // D1: the PEP's key is its own, and the TLS client key is the
+            // receiver's.
+            let client_key = tls.as_ref().and_then(|item| item.key.as_deref()).and_then(crate::pep::pem_thumbprint);
+            if client_key.is_some_and(|thumbprint| thumbprint == pep.key_thumbprint()) {
+                return Err(fail("config", "the receiver's TLS client key is pep.assertionKey; the PEP needs a key of its own"));
+            }
+            // The PEP's policy events ride this stream (iya-sts#1206 D4).
+            if crate::pep::wants_events(&pep) {
+                if !events_requested.iter().any(|item| item == crate::pep::POLICIES_CHANGED_EVENT) {
+                    events_requested.push(crate::pep::POLICIES_CHANGED_EVENT.to_string());
+                }
+                event_pep = Some(Arc::clone(&pep));
+                // A handler sees an event only after its SET was verified;
+                // the PEP treats it as a hint and pulls with its own token.
+                let handler: HandlerFn = Arc::new(move |event: &SignalEvent| {
+                    pep.on_policy_event(&event.payload);
+                    Ok(())
+                });
+                handlers.insert(crate::pep::POLICIES_CHANGED_EVENT.to_string(), vec![handler]);
+            }
+        }
         Ok(Arc::new(Self {
             transmitter: transmitter.trim_end_matches('/').to_string(),
             on_end,
             tls,
-            events_requested: opts.events_requested.unwrap_or_else(events::default_events_requested),
+            events_requested,
             end_on: opts.end_on.unwrap_or_else(events::default_ending_events),
             index: opts.index.unwrap_or_else(|| MemorySessionIndex::new(0)),
             subject_attribute: opts.subject_attribute,
@@ -138,7 +209,13 @@ impl SignalsReceiver {
             poll_interval_ms: if opts.poll_interval_ms == 0 { 5000 } else { opts.poll_interval_ms },
             max_events: if opts.max_events == 0 { 50 } else { opts.max_events },
             log: opts.log.unwrap_or_else(|| Arc::new(StdLog)),
-            state: Mutex::new(State { config: Map::new(), stream: Map::new(), keys: Vec::new(), keys_at: None, ack: Vec::new(), errs: Map::new(), handlers: HashMap::new() }),
+            add_subjects: opts.add_subjects,
+            subjects: Mutex::new(SubjectsHealth::default()),
+            #[cfg(feature = "pep")]
+            pep: event_pep,
+            #[cfg(feature = "pep")]
+            pep_stream: Mutex::new(None),
+            state: Mutex::new(State { config: Map::new(), stream: Map::new(), keys: Vec::new(), keys_at: None, ack: Vec::new(), errs: Map::new(), handlers }),
             running: AtomicBool::new(false),
             inflight: Mutex::new(None),
             stop_tx: Mutex::new(None),
@@ -147,15 +224,120 @@ impl SignalsReceiver {
         }))
     }
 
+    /// The event types this receiver asks its stream for.
+    pub fn events_requested(&self) -> &[String] {
+        &self.events_requested
+    }
+
+    /// Whether the session `local_id` is tracked: tracked, not untracked,
+    /// not past its expiry, and not ended by an event.
+    pub fn is_tracked(&self, local_id: &str) -> bool {
+        self.index.contains(local_id)
+    }
+
     pub fn stream(&self) -> Map<String, Value> {
         self.state.lock().unwrap().stream.clone()
     }
 
+    /// Tracks a local session, and (with `add_subjects`, a running receiver
+    /// and a transmitter that publishes `add_subject_endpoint`) asks the
+    /// transmitter to send this stream events about its person. The call is
+    /// made inline, on the sign-in's own thread, bounded by the HTTP client's
+    /// timeout; its outcome is logged and counted, never returned: a
+    /// sign-in does not fail because the transmitter refused a subject.
     pub fn track(&self, local_id: &str, login: &Login, expires_at: Option<DateTime<Utc>>) {
-        self.index.add(tracked_from(local_id, Some(login), &self.subject_attribute, expires_at));
+        let session = tracked_from(local_id, Some(login), &self.subject_attribute, expires_at);
+        self.index.add(session.clone());
+        self.subject_call(true, &session);
     }
 
-    pub fn untrack(&self, local_id: &str) { self.index.remove(local_id); }
+    /// Stops tracking a local session; when it was the person's last one,
+    /// asks the transmitter to stop sending events about them (Remove
+    /// Subject, as `track` adds them).
+    pub fn untrack(&self, local_id: &str) { self.forget(local_id); }
+
+    /// What Add Subject and Remove Subject have done.
+    pub fn subjects_health(&self) -> SubjectsHealth { self.subjects.lock().unwrap().clone() }
+
+    fn forget(&self, local_id: &str) {
+        let Some(session) = self.index.take(local_id) else { return };
+        let others = if !session.person.is_empty() {
+            self.index.by_person(&session.person)
+        } else if !session.email.is_empty() {
+            self.index.by_email(&session.email)
+        } else {
+            Vec::new()
+        };
+        if others.is_empty() {
+            self.subject_call(false, &session);
+        }
+    }
+
+    /// The subject identifier events about this session's person carry, as
+    /// `sessions_for` matches them: `iss_sub` (the transmitter as issuer and
+    /// the subject attribute) when the person is known, else `email`.
+    fn subject_of_session(&self, session: &Session, issuer: &str) -> Option<Value> {
+        if !session.person.is_empty() && !issuer.is_empty() {
+            return Some(json!({"format": "iss_sub", "iss": issuer, "sub": session.person}));
+        }
+        if !session.email.is_empty() {
+            return Some(json!({"format": "email", "email": session.email}));
+        }
+        None
+    }
+
+    /// Add Subject (`add`) or Remove Subject. Skipped when switched off, not
+    /// running, without a stream, without the endpoint, or without an
+    /// identifier for the person. Never retried, never an error to the caller.
+    fn subject_call(&self, add: bool, session: &Session) {
+        if !self.add_subjects || !self.running.load(Ordering::SeqCst) { return; }
+        let issuer = text_of(&self.state.lock().unwrap().config, "issuer");
+        let Some(subject) = self.subject_of_session(session, &issuer) else { return };
+        self.send_subject(add, subject);
+    }
+
+    /// Add Subject or Remove Subject for `subject` on this stream, once;
+    /// the outcome is logged and counted (`subjects_health`).
+    fn send_subject(&self, add: bool, subject: Value) {
+        let (endpoint, stream_id) = {
+            let state = self.state.lock().unwrap();
+            let name = if add { "add_subject_endpoint" } else { "remove_subject_endpoint" };
+            (text_of(&state.config, name), text_of(&state.stream, "stream_id"))
+        };
+        if endpoint.is_empty() || stream_id.is_empty() { return; }
+        let mut body = json!({"stream_id": stream_id, "subject": subject});
+        // verified (section 8.1.3.2): a person comes from a token this library
+        // verified, issued by the identity provider that is this transmitter;
+        // the application is this receiver's own.
+        if add { body["verified"] = Value::Bool(true); }
+        let what = if add { "adding" } else { "removing" };
+        let format = body["subject"]["format"].as_str().unwrap_or("").to_string();
+        let outcome = self.call("POST", &endpoint, Some(&body));
+        let mut health = self.subjects.lock().unwrap();
+        match outcome {
+            Ok((200..=299, _)) => {
+                if add { health.added += 1 } else { health.removed += 1 }
+            }
+            Ok((status, parsed)) => {
+                let mut text = parsed.to_string();
+                if text.len() > 300 { text.truncate(300); }
+                let line = format!("ssf: {what} a subject ({format}) on stream {stream_id} answered {status}: {text}");
+                if (400..500).contains(&status) { health.refused += 1 } else { health.failed += 1 }
+                health.last_error = line.clone();
+                drop(health);
+                // A 403 is expected in a race: the person's session at the
+                // transmitter ended before this call (iya-sts#2234).
+                if status == 403 { self.log.warn(&line) } else { self.log.error(&line) }
+            }
+            Err(err) => {
+                let line = format!("ssf: {what} a subject ({format}) on stream {stream_id} failed: {err}");
+                health.failed += 1;
+                health.last_error = line.clone();
+                drop(health);
+                self.log.error(&line);
+            }
+        }
+    }
 
     pub fn on(self: &Arc<Self>, event_type: &str, handler: HandlerFn) {
         self.state.lock().unwrap().handlers.entry(event_type.to_string()).or_default().push(handler);
@@ -167,6 +349,15 @@ impl SignalsReceiver {
         self.state.lock().unwrap().config = config;
         self.jwks(true)?;
         let stream = self.ensure_stream()?;
+        // The PEP's heartbeat says whether this stream carries its event.
+        #[cfg(feature = "pep")]
+        if let Some(pep) = &self.pep {
+            let carries = |name: &str| stream.get(name).and_then(Value::as_array).map(|list| list.iter().any(|v| v.as_str() == Some(crate::pep::POLICIES_CHANGED_EVENT)));
+            let carried = carries("events_delivered").or_else(|| carries("events_requested")).unwrap_or(true);
+            let state = if carried { crate::pep::EventStream::Requested } else { crate::pep::EventStream::Excluded };
+            pep.set_event_stream(state);
+            *self.pep_stream.lock().unwrap() = Some(state);
+        }
         let endpoint = delivery_url(&stream);
         if endpoint.is_empty() { return Err(fail("ssf", "the stream has no poll endpoint_url")); }
         if self.running.load(Ordering::SeqCst) {
@@ -182,6 +373,18 @@ impl SignalsReceiver {
         *self.stop_tx.lock().unwrap() = Some(stop_tx);
         *self.done_rx.lock().unwrap() = Some(done_rx);
         self.running.store(true, Ordering::SeqCst);
+        // A transmitter narrows a stream that names subjects to those
+        // subjects (iya-sts under default_subjects ALL; SSF 1.0 8.1.3).
+        // `pep-policies-changed` is about the application the PEP is embedded
+        // in, a complex subject whose `application` member is
+        // {format: opaque, id: <application>}; once people are added, the
+        // stream would stop carrying it unless the application is named too.
+        #[cfg(feature = "pep")]
+        if self.add_subjects {
+            if let Some(pep) = &self.pep {
+                self.send_subject(true, json!({"format": "opaque", "id": pep.config().application}));
+            }
+        }
         let this = Arc::clone(self);
         let handle = thread::spawn(move || {
             this.loop_poll(stop_rx);
@@ -193,6 +396,9 @@ impl SignalsReceiver {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        // A stopped receiver hears nothing: the PEP polls from now on.
+        #[cfg(feature = "pep")]
+        self.report_pep_stream(Some(crate::pep::EventStream::Down));
         if let Some(tx) = self.stop_tx.lock().unwrap().take() { let _ = tx.send(()); }
         let done = self.done_rx.lock().unwrap().take();
         if let Some(done) = done {
@@ -237,6 +443,11 @@ impl SignalsReceiver {
             flight
         };
         let result = self.poll_now();
+        // The PEP's view of the stream follows the polls: down while they
+        // fail (it polls its own policies instead), and what the stream
+        // carries again once one succeeds.
+        #[cfg(feature = "pep")]
+        self.report_pep_stream(if result.is_ok() { *self.pep_stream.lock().unwrap() } else { Some(crate::pep::EventStream::Down) });
         *flight.result.lock().unwrap() = Some(result.clone());
         {
             let mut slot = self.inflight.lock().unwrap();
@@ -245,6 +456,33 @@ impl SignalsReceiver {
         *flight.done.lock().unwrap() = true;
         flight.cv.notify_all();
         result
+    }
+
+    /// Asks the transmitter for a verification event on this stream (SSF
+    /// 1.0 section 8.1.4): it arrives on the stream like any other event,
+    /// carrying `state` back when one was given. Needs a started receiver.
+    pub fn verify(&self, state: &str) -> Result<()> {
+        let (endpoint, stream_id) = {
+            let shared = self.state.lock().unwrap();
+            (text_of(&shared.config, "verification_endpoint"), text_of(&shared.stream, "stream_id"))
+        };
+        if endpoint.is_empty() { return Err(fail("ssf", "the transmitter publishes no verification_endpoint")); }
+        if stream_id.is_empty() { return Err(fail("ssf", "the receiver has no stream yet: start it first")); }
+        let mut body = json!({"stream_id": stream_id});
+        if !state.is_empty() { body["state"] = Value::String(state.to_string()); }
+        let (status, _) = self.call("POST", &endpoint, Some(&body))?;
+        if status != 200 && status != 204 { return Err(fail("ssf", format!("verification answered {status}"))); }
+        Ok(())
+    }
+
+    /// Tells the PEP whose events this stream carries what the stream is
+    /// doing, so its heartbeat's `policyEvents` is true and it polls its own
+    /// policies when it cannot hear.
+    #[cfg(feature = "pep")]
+    fn report_pep_stream(&self, state: Option<crate::pep::EventStream>) {
+        if let (Some(pep), Some(state)) = (&self.pep, state) {
+            pep.set_event_stream(state);
+        }
     }
 
     fn poll_now(&self) -> Result<bool> {
@@ -354,7 +592,7 @@ impl SignalsReceiver {
                     event.ended = false;
                 }
                 if ended {
-                    for local_id in &sessions { self.index.remove(local_id); }
+                    for local_id in &sessions { self.forget(local_id); }
                 }
             }
             let handlers = {
@@ -438,7 +676,7 @@ impl SignalsReceiver {
                 let Some(stream) = item.as_object() else { continue };
                 if text_of(stream, "stream_id").is_empty() { continue; }
                 let method = stream.get("delivery").and_then(|value| value.as_object()).map(|delivery| text_of(delivery, "method")).unwrap_or_default();
-                if method == POLL_METHOD { return Ok(stream.clone()); }
+                if method == POLL_METHOD { return Ok(self.with_requested_events(stream.clone(), &endpoint)); }
             }
         } else if status != 404 {
             let mut text = parsed.to_string();
@@ -457,6 +695,47 @@ impl SignalsReceiver {
             return Err(fail("ssf", format!("creating a stream at {endpoint} answered {status}: {text}")));
         }
         Ok(stream)
+    }
+
+    /// A stream found rather than created can predate an event type this
+    /// receiver asks for now: the embedded PEP's `pep-policies-changed`,
+    /// added once the configuration gained a `pep` section (or moved from
+    /// `central` to `local`). Reused as it was, the transmitter never sends
+    /// that type and the PEP hears of a change only on its fallback poll.
+    /// PATCH merges the missing types in (SSF 1.0, updating a stream). A
+    /// transmitter that refuses leaves the stream as it was, and the refusal
+    /// goes to the log's `error`; the receiver still starts.
+    fn with_requested_events(&self, stream: Map<String, Value>, endpoint: &str) -> Map<String, Value> {
+        let listed = |name: &str| stream.get(name).and_then(Value::as_array).map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>());
+        let Some(requested) = listed("events_requested").or_else(|| listed("events_delivered")) else {
+            return stream;
+        };
+        let missing: Vec<String> = self.events_requested.iter().filter(|e| !requested.contains(e)).cloned().collect();
+        if missing.is_empty() {
+            return stream;
+        }
+        let stream_id = text_of(&stream, "stream_id");
+        let mut merged = requested;
+        merged.extend(missing.iter().cloned());
+        let body = json!({"stream_id": stream_id, "events_requested": merged});
+        let line = match self.call("PATCH", endpoint, Some(&body)) {
+            Ok((200, Value::Object(mut updated))) if text_of(&updated, "stream_id") == stream_id => {
+                if !updated.contains_key("delivery") {
+                    if let Some(delivery) = stream.get("delivery") {
+                        updated.insert("delivery".into(), delivery.clone());
+                    }
+                }
+                return updated;
+            }
+            Ok((status, parsed)) => {
+                let mut text = parsed.to_string();
+                if text.len() > 300 { text.truncate(300); }
+                format!("ssf: adding {} to stream {stream_id} answered {status}: {text}", missing.join(", "))
+            }
+            Err(err) => format!("ssf: adding {} to stream {stream_id} failed: {err}", missing.join(", ")),
+        };
+        self.log.error(&line);
+        stream
     }
 
     fn call(&self, method: &str, url: &str, body: Option<&Value>) -> Result<(u16, Value)> {

@@ -7,7 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-RUN cargo test
+# Every feature, then the default build's tests that need the feature off
+# (a pep section refused).
+RUN cargo test --all-features && cargo test --lib pep_section_is_refused
 
 FROM rust:1-bookworm
 WORKDIR /app
@@ -16,7 +18,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src src
 # src/demo.rs compiles demo/public/styles.css in (include_str!).
 COPY demo/public demo/public
-RUN cargo build --release --bin wsfed-demo --bin wsfed-caep \
+# `local`: the demo's /orders/<id> route asks the embedded PEP.
+RUN cargo build --release --features local --bin wsfed-demo --bin wsfed-caep \
  && cp target/release/wsfed-demo /usr/local/bin/wsfed-demo \
  && cp target/release/wsfed-caep /usr/local/bin/wsfed-caep
 # demo/ comes after the build, so a new trust chain does not rebuild the binaries.

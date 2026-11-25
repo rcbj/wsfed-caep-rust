@@ -45,31 +45,59 @@ fn two_certificates_of_one_name_have_different_key_identifiers() {
     assert_ne!(key_id_after(&one.certificate_der, SKI_OID), key_id_after(&two.certificate_der, SKI_OID));
 }
 
-#[test]
-fn generate_keys_names_the_certificate_after_the_realm() {
-    let dir = std::env::temp_dir().join(format!("wsfed-x509-{}", std::process::id()));
+/// `generate-keys --config` into a fresh directory with `extra` arguments:
+/// the certificate it wrote, and the key file's path.
+fn generated(tag: &str, realm: &str, extra: &[&str]) -> (crate::signature::IdpCert, std::path::PathBuf, std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("wsfed-x509-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let config = dir.join("wsfed.json");
-    std::fs::write(&config, r#"{"realm":"http://localhost:3000/","replyUrl":"http://localhost:3000/wsfed","idpMetadata":"x","privateKey":"k.pem","certificate":"c.pem"}"#).unwrap();
+    std::fs::write(&config, format!(r#"{{"realm":"{realm}","replyUrl":"{realm}wsfed","idpMetadata":"x","privateKey":"k.pem","certificate":"c.pem"}}"#)).unwrap();
+    let mut args: Vec<String> = vec!["generate-keys".into(), "--config".into(), config.display().to_string(), "--bits".into(), "2048".into()];
+    args.extend(extra.iter().map(|item| item.to_string()));
     let mut out = Vec::new();
-    let code = cli::main(&[
-        "generate-keys".into(),
-        "--config".into(),
-        config.display().to_string(),
-        "--bits".into(),
-        "2048".into(),
-    ], &mut out);
-    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
-    let cert_path = dir.join("c.pem");
-    let key_path = dir.join("k.pem");
-    let pem = std::fs::read_to_string(&cert_path).unwrap();
-    let cert = x509util::load_cert(&pem).unwrap();
-    let want = "CN=wsfed-caep-nodejs relying party http://localhost:3000/";
-    assert_eq!(x509util::subject_string(&cert.der), want);
-    assert_eq!(x509util::subject_cn(&cert.der), "wsfed-caep-nodejs relying party http://localhost:3000/");
+    let code = cli::main(&args, &mut out);
+    let printed = String::from_utf8_lossy(&out).to_string();
+    assert_eq!(code, 0, "{printed}");
+    let cert = x509util::load_cert(&std::fs::read_to_string(dir.join("c.pem")).unwrap()).unwrap();
+    (cert, dir.join("k.pem"), dir, printed)
+}
+
+#[test]
+fn generate_keys_names_the_demo_rp_and_the_realm_it_serves() {
+    // --realm, as the install script passes it: the realm as it runs.
+    let (cert, key_path, dir, printed) = generated("realm", "http://localhost:3000/", &["--realm", "http://127.0.0.1:3048/"]);
+    assert_eq!(x509util::subject_string(&cert.der), "CN=wsfed-caep-rust demo RP, OU=http://127.0.0.1:3048/");
+    assert_eq!(x509util::subject_cn(&cert.der), cli::DEFAULT_COMMON_NAME);
+    assert_eq!(x509util::subject_alt_uris(&cert.der), vec!["http://127.0.0.1:3048/".to_string()]);
+    assert!(!x509util::subject_string(&cert.der).contains("nodejs") && !x509util::subject_string(&cert.der).contains(":3000"), "neither the Node name nor the old port");
+    assert!(printed.contains("subject   CN=wsfed-caep-rust demo RP, OU=http://127.0.0.1:3048/") && printed.contains("SAN URI   http://127.0.0.1:3048/"), "{printed}");
     assert_eq!(std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, 0o600);
-    assert_eq!(std::fs::metadata(&cert_path).unwrap().permissions().mode() & 0o777, 0o644);
+    assert_eq!(std::fs::metadata(dir.join("c.pem")).unwrap().permissions().mode() & 0o777, 0o644);
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = out;
+
+    // --public-url moves the configured realm's origin, as the demo does.
+    let (cert, _, dir, _) = generated("public", "http://localhost:3000/", &["--public-url", "https://rp.example.test"]);
+    assert_eq!(x509util::subject_alt_uris(&cert.der), vec!["https://rp.example.test/".to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Neither: the configured realm as the demo would serve it here (PORT
+    // moves a loopback port), and --cn names it otherwise.
+    let (cert, _, dir, _) = generated("config", "http://localhost:3000/", &["--cn", "orders portal RP"]);
+    let want = cli::running_realm("http://localhost:3000/", &std::collections::HashMap::new());
+    assert_eq!(x509util::subject_string(&cert.der), format!("CN=orders portal RP, OU={want}"));
+    assert_eq!(x509util::subject_alt_uris(&cert.der), vec![want]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_long_realm_is_clipped_in_the_subject_and_whole_in_the_alt_name() {
+    let realm = format!("https://rp.example.test/{}/", "a".repeat(80));
+    let pair = x509util::create_named_key_pair(&x509util::CertificateName { common_name: "x".into(), unit: realm.clone(), uri: realm.clone() }, 30, 2048).unwrap();
+    let subject = x509util::subject_string(&pair.certificate_der);
+    assert_eq!(subject, format!("CN=x, OU={}", &realm[..64]), "RFC 5280: at most 64 characters");
+    assert_eq!(x509util::subject_alt_uris(&pair.certificate_der), vec![realm]);
+    let plain = create_self_signed_key_pair("rp", 30, 2048).unwrap();
+    assert_eq!(x509util::subject_string(&plain.certificate_der), "CN=rp");
+    assert!(x509util::subject_alt_uris(&plain.certificate_der).is_empty());
 }

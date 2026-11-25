@@ -9,6 +9,8 @@ pub mod error;
 pub mod httpclient;
 pub mod metadata;
 pub mod names;
+#[cfg(feature = "pep")]
+pub mod pep;
 pub mod relying_party;
 pub mod replay;
 pub mod signature;
@@ -27,7 +29,7 @@ pub use relying_party::{LoginOptions, LoginRequest, RelyingParty, ReplyBody, Rep
 pub use signature::sign_enveloped;
 pub use ssf::{events, SignalsReceiver};
 pub use token::Login;
-pub use x509util::{create_self_signed_key_pair, KeyPair};
+pub use x509util::{create_named_key_pair, create_self_signed_key_pair, CertificateName, KeyPair};
 
 pub fn from_file(path: &str, overrides: Option<serde_json::Map<String, serde_json::Value>>) -> Result<RelyingParty> {
     RelyingParty::from_file(path, overrides)
@@ -53,3 +55,13 @@ mod test_configure;
 mod test_trust_chain;
 #[cfg(test)]
 mod test_plain_http;
+#[cfg(test)]
+mod test_pep;
+#[cfg(all(test, feature = "local"))]
+mod test_authzen;
+#[cfg(test)]
+mod test_demo_pep;
+#[cfg(test)]
+mod test_demo;
+#[cfg(all(test, feature = "local"))]
+mod test_demo_decisions;
